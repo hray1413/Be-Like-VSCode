@@ -357,6 +357,40 @@ class CodeEditor(QPlainTextEdit):
         self.completer.activated.connect(self.insert_completion)
         self.cursorPositionChanged.connect(self.highlight_brackets)
 
+        # 初始 viewport 通知（視窗剛開啟時）
+        self.verticalScrollBar().valueChanged.connect(self._notify_viewport)
+
+    def _notify_viewport(self, *_):
+        """把目前可見的行號範圍告訴 highlighter。"""
+        first = self.firstVisibleBlock()
+        if not first.isValid():
+            return
+        first_line = first.blockNumber()
+
+        # 算出最後一個可見行
+        block      = first
+        last_line  = first_line
+        vp_bottom  = self.viewport().rect().bottom()
+        while block.isValid():
+            bounding = self.blockBoundingGeometry(block).translated(self.contentOffset())
+            if bounding.top() > vp_bottom:
+                break
+            last_line = block.blockNumber()
+            block = block.next()
+
+        self.highlighter.set_viewport(first_line, last_line)
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        if dy != 0:
+            self._notify_viewport()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.lineNumberArea.setGeometry(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
+        self._notify_viewport()
+
     def insert_completion(self, text):
         tc = self.textCursor()
         extra = len(text) - len(self.completer.completionPrefix())
@@ -557,11 +591,6 @@ class CodeEditor(QPlainTextEdit):
         digits = len(str(max(1, self.blockCount())))
         return 6 + self.fontMetrics().horizontalAdvance('9') * digits
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        cr = self.contentsRect()
-        self.lineNumberArea.setGeometry(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
-
     def updateLineNumberAreaWidth(self, _):
         self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
 
@@ -591,16 +620,21 @@ class CodeEditor(QPlainTextEdit):
             blockNumber += 1
 
 # ══════════════════════════════════════════════════════════════════════
-#  非同步語法高亮架構
+#  增量 Viewport 高亮架構
 #
-#  小檔（< SYNC_THRESHOLD 行）→ 直接在主執行緒 highlightBlock() 同步高亮
-#  大檔                       → HighlightWorker（QThread）在背景跑 re，
-#                               算完後 signal 通知 BaseHighlighter 套用結果
+#  小檔（< SYNC_THRESHOLD 行）
+#    → highlightBlock() 直接同步，零延遲
+#
+#  大檔（≥ SYNC_THRESHOLD 行）
+#    → 只計算 viewport ± VIEWPORT_PADDING 行的範圍
+#    → 結果存進 dict 快取（行號 → spans），已算過的行不重算
+#    → 文字變動時只 invalidate 受影響的行，不清空整個快取
+#    → Worker 帶 abort flag，debounce 150ms 後才啟動，避免連打堆積
 # ══════════════════════════════════════════════════════════════════════
-SYNC_THRESHOLD = 500   # 行數門檻，低於此值同步高亮
+SYNC_THRESHOLD   = 500    # 低於此行數直接同步高亮
+VIEWPORT_PADDING = 300    # viewport 上下各多算幾行當緩衝
 
-# ── 格式描述（可跨 thread 傳遞的純資料）─────────────────────────────
-# 每條 rule 用 Python re.compile 物件 + 顏色字串儲存
+# ── Rule 描述（純資料，可跨 thread）────────────────────────────────────
 class _Rule:
     __slots__ = ('pattern', 'color', 'bold', 'italic')
     def __init__(self, pattern, color, bold=False, italic=False):
@@ -609,47 +643,75 @@ class _Rule:
         self.bold    = bold
         self.italic  = italic
 
-# ── 背景 Worker ───────────────────────────────────────────────────────
+# ── 背景 Worker：只算指定行範圍 ────────────────────────────────────────
 class HighlightWorker(QThread):
     """
-    在子執行緒中對整份文字跑 re，產出
-      results: list[ list[ (start, length, color, bold, italic) ] ]
-    每個外層元素對應一行。
-    """
-    results_ready = pyqtSignal(list)   # 算完後發給 highlighter
+    接收 lines（list[str]）和起始行號 line_offset，
+    只對這批行跑 re，產出 {絕對行號: spans} dict。
 
-    def __init__(self, text, rules, parent=None):
+    每處理一行前檢查 _abort，被 abort() 後立刻 return 不 emit，
+    避免過期結果覆蓋新的高亮。
+    """
+    results_ready = pyqtSignal(dict, int, int)  # (cache_patch, range_start, range_end)
+
+    def __init__(self, lines, line_offset, rules, parent=None):
         super().__init__(parent)
-        self._text  = text
-        self._rules = rules        # list[_Rule]
+        self._lines       = lines        # 本次要算的那些行文字
+        self._line_offset = line_offset  # 這批行在整份文件的起始行號
+        self._rules       = rules
+        self._abort       = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
-        lines = self._text.split('\n')
-        output = []
-        for line in lines:
+        patch = {}
+        for i, line in enumerate(self._lines):
+            if self._abort:
+                return                   # 不 emit，結果丟棄
             spans = []
             for rule in self._rules:
                 for m in rule.pattern.finditer(line):
                     spans.append((m.start(), m.end() - m.start(),
                                   rule.color, rule.bold, rule.italic))
-            output.append(spans)
-        self.results_ready.emit(output)
+            patch[self._line_offset + i] = spans
+        self.results_ready.emit(
+            patch,
+            self._line_offset,
+            self._line_offset + len(self._lines) - 1
+        )
 
-# ── 基礎高亮器 ────────────────────────────────────────────────────────
+# ── 基礎高亮器 ─────────────────────────────────────────────────────────
 class BaseHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
         self._rules: list[_Rule] = []
-        self._async_data: list[list] = []   # Worker 回傳結果快取
+
+        # 行快取：{行號(int) -> spans(list)}，只存算過的行
+        self._cache: dict[int, list] = {}
+
+        # 目前 viewport 範圍（行號），由 CodeEditor 呼叫 set_viewport() 更新
+        self._vp_start = 0
+        self._vp_end   = 0
+
         self._worker: HighlightWorker | None = None
+
+        # Debounce：150ms 靜止才啟動 Worker
+        self._debounce = QTimer()
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(150)
+        self._debounce.timeout.connect(self._launch_worker)
+
+        # 記錄哪些行被 invalidate（文字改動），Worker 啟動時才真正重算
+        self._dirty: set[int] = set()
+
         self._setup_rules()
-        # 監聽文字變動，大檔時啟動背景 Worker
         document.contentsChanged.connect(self._on_contents_changed)
 
     def _setup_rules(self):
-        pass  # 子類覆寫，呼叫 _kw() / _re()
+        pass   # 子類覆寫
 
-    # ── 快速格式建立 ──
+    # ── 格式輔助 ──
     @staticmethod
     def _make_fmt(color, bold=False, italic=False):
         fmt = QTextCharFormat()
@@ -660,48 +722,108 @@ class BaseHighlighter(QSyntaxHighlighter):
 
     def _kw(self, words, color="#569cd6", bold=True):
         for w in words:
-            pat = re.compile(rf"\b{re.escape(w)}\b")
-            self._rules.append(_Rule(pat, color, bold=bold))
+            self._rules.append(_Rule(re.compile(rf"\b{re.escape(w)}\b"), color, bold=bold))
 
     def _re(self, pattern, color, bold=False, italic=False):
-        pat = re.compile(pattern)
-        self._rules.append(_Rule(pat, color, bold=bold, italic=italic))
+        self._rules.append(_Rule(re.compile(pattern), color, bold=bold, italic=italic))
 
-    # ── 文字變動時決定同步 or 非同步 ──
+    # ── Viewport 更新（由 CodeEditor.scrollContentsBy / resizeEvent 呼叫）──
+    def set_viewport(self, first_line: int, last_line: int):
+        new_start = max(0, first_line - VIEWPORT_PADDING)
+        new_end   = last_line + VIEWPORT_PADDING
+
+        # viewport 沒變就不重啟
+        if new_start == self._vp_start and new_end == self._vp_end:
+            return
+
+        self._vp_start = new_start
+        self._vp_end   = new_end
+        self._debounce.start()   # 稍微 debounce，避免快速滾動時狂重啟
+
+    # ── 文字變動：invalidate 受影響的行 ──
     def _on_contents_changed(self):
+        doc = self.document()
+        if doc is None or doc.blockCount() < SYNC_THRESHOLD:
+            return
+
+        # 找出目前游標所在的行，以及前後各 5 行一起 invalidate
+        # （因為一次改動可能影響字串跨行、縮排等）
+        try:
+            from PyQt5.QtWidgets import QApplication
+            widget = QApplication.focusWidget()
+            if widget and hasattr(widget, 'textCursor'):
+                cur_line = widget.textCursor().blockNumber()
+                for ln in range(max(0, cur_line - 5), cur_line + 6):
+                    self._dirty.add(ln)
+                    self._cache.pop(ln, None)   # 立刻從快取移除，確保不顯示舊結果
+        except Exception:
+            pass
+
+        self._debounce.start()
+
+    # ── 啟動（或重啟）Worker，只算 viewport 範圍內 dirty 或未快取的行 ──
+    def _launch_worker(self):
+        doc = self.document()
+        if doc is None or doc.blockCount() < SYNC_THRESHOLD:
+            return
+
+        # abort 舊 Worker
+        if self._worker and self._worker.isRunning():
+            self._worker.abort()
+            self._worker.finished.connect(self._worker.deleteLater)
+            self._worker = None
+
+        # 決定本次要算的行：viewport 範圍內，且不在快取裡（或被 dirty 掉）的
+        all_lines = doc.toPlainText().split('\n')
+        total     = len(all_lines)
+        vp_end    = min(self._vp_end, total - 1)
+
+        to_compute = [
+            ln for ln in range(self._vp_start, vp_end + 1)
+            if ln not in self._cache          # 未快取
+        ]
+        self._dirty.clear()
+
+        if not to_compute:
+            return   # 全部都在快取裡，不需要開 thread
+
+        # 取出連續的 lines 讓 Worker 處理（保留原始行號對應）
+        first = to_compute[0]
+        last  = to_compute[-1]
+        lines_slice = all_lines[first: last + 1]
+
+        worker = HighlightWorker(lines_slice, first, self._rules, self)
+        worker.results_ready.connect(self._on_results_ready)
+        self._worker = worker
+        worker.start()
+
+    def _on_results_ready(self, patch: dict, range_start: int, range_end: int):
+        # 把新算好的結果合併進快取
+        self._cache.update(patch)
+
+        # 只重新 highlight 這次算的那個範圍，不 rehighlight 整份文件
         doc = self.document()
         if doc is None:
             return
-        line_count = doc.blockCount()
-        if line_count >= SYNC_THRESHOLD:
-            self._start_worker(doc.toPlainText())
-
-    def _start_worker(self, text):
-        # 如果前一個 Worker 還在跑，先停掉
-        if self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(200)
-        self._worker = HighlightWorker(text, self._rules, self)
-        self._worker.results_ready.connect(self._on_results_ready)
-        self._worker.start()
-
-    def _on_results_ready(self, data):
-        self._async_data = data
-        # 通知 Qt 重新高亮所有區塊
-        self.rehighlight()
+        block = doc.findBlockByNumber(range_start)
+        while block.isValid() and block.blockNumber() <= range_end:
+            self.rehighlightBlock(block)
+            block = block.next()
 
     # ── Qt 每次渲染一行時呼叫 ──
     def highlightBlock(self, text):
-        block_num = self.currentBlock().blockNumber()
+        block_num  = self.currentBlock().blockNumber()
         line_count = self.document().blockCount()
 
-        if line_count >= SYNC_THRESHOLD and self._async_data:
-            # 大檔：從快取取預算好的結果直接套用，速度極快
-            if block_num < len(self._async_data):
-                for start, length, color, bold, italic in self._async_data[block_num]:
+        if line_count >= SYNC_THRESHOLD:
+            spans = self._cache.get(block_num)
+            if spans is not None:
+                # 快取命中：直接套用，幾乎零開銷
+                for start, length, color, bold, italic in spans:
                     self.setFormat(start, length, self._make_fmt(color, bold, italic))
+            # 快取未命中（viewport 外或尚未算到）：留白，等 Worker 算完再補
         else:
-            # 小檔：同步直接跑 re（低延遲，不需要 thread overhead）
+            # 小檔：同步直接跑 re
             for rule in self._rules:
                 for m in rule.pattern.finditer(text):
                     self.setFormat(m.start(), m.end() - m.start(),
