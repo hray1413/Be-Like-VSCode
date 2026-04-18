@@ -313,85 +313,36 @@ class CodeEditor(QPlainTextEdit):
             bottom = top + int(self.blockBoundingRect(block).height())
             blockNumber += 1
 
-# ───────────────────────────── Python 語法高亮 ────────────────────────
-class PythonHighlighter(QSyntaxHighlighter):
+# ══════════════════════════════════════════════════════════════════════
+#  通用基礎高亮器：子類只需填 rules，highlightBlock 共用
+# ══════════════════════════════════════════════════════════════════════
+class BaseHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
         self.highlightingRules = []
+        self._setup_rules()
 
-        kwFmt = QTextCharFormat()
-        kwFmt.setForeground(QColor("#569cd6"))
-        kwFmt.setFontWeight(QFont.Bold)
-        for word in ['def', 'class', 'if', 'elif', 'else', 'try', 'except', 'finally',
-                     'while', 'for', 'in', 'import', 'from', 'as', 'return', 'with', 'pass',
-                     'break', 'continue', 'and', 'or', 'not', 'is', 'lambda', 'True', 'False', 'None']:
-            self.highlightingRules.append((QRegExp(f"\\b{word}\\b"), kwFmt))
+    def _setup_rules(self):
+        pass  # 子類覆寫
 
-        builtinFmt = QTextCharFormat()
-        builtinFmt.setForeground(QColor("#dcdcaa"))
-        for word in ['print', 'len', 'range', 'enumerate', 'open', 'type',
-                     'isinstance', 'list', 'dict', 'set', 'tuple', 'int', 'str',
-                     'float', 'bool', 'super', 'self']:
-            self.highlightingRules.append((QRegExp(f"\\b{word}\\b"), builtinFmt))
+    # 快速建立格式
+    @staticmethod
+    def _fmt(color, bold=False, italic=False):
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if bold:
+            fmt.setFontWeight(QFont.Bold)
+        if italic:
+            fmt.setFontItalic(True)
+        return fmt
 
-        decorFmt = QTextCharFormat()
-        decorFmt.setForeground(QColor("#c586c0"))
-        self.highlightingRules.append((QRegExp("@\\w+"), decorFmt))
+    def _kw(self, words, color="#569cd6", bold=True):
+        fmt = self._fmt(color, bold=bold)
+        for w in words:
+            self.highlightingRules.append((QRegExp(f"\\b{w}\\b"), fmt))
 
-        numFmt = QTextCharFormat()
-        numFmt.setForeground(QColor("#b5cea8"))
-        self.highlightingRules.append((QRegExp("\\b[0-9]+\\.?[0-9]*\\b"), numFmt))
-
-        strFmt = QTextCharFormat()
-        strFmt.setForeground(QColor("#ce9178"))
-        self.highlightingRules.append((QRegExp('"[^"\\\\]*(\\\\.[^"\\\\]*)*"'), strFmt))
-        self.highlightingRules.append((QRegExp("'[^'\\\\]*(\\\\.[^'\\\\]*)*'"), strFmt))
-
-        commentFmt = QTextCharFormat()
-        commentFmt.setForeground(QColor("#6a9955"))
-        commentFmt.setFontItalic(True)
-        self.highlightingRules.append((QRegExp("#.*"), commentFmt))
-
-        funcFmt = QTextCharFormat()
-        funcFmt.setForeground(QColor("#dcdcaa"))
-        self.highlightingRules.append((QRegExp("\\bdef\\s+(\\w+)"), funcFmt))
-
-        classFmt = QTextCharFormat()
-        classFmt.setForeground(QColor("#4ec9b0"))
-        self.highlightingRules.append((QRegExp("\\bclass\\s+(\\w+)"), classFmt))
-
-    def highlightBlock(self, text):
-        for pattern, fmt in self.highlightingRules:
-            index = pattern.indexIn(text)
-            while index >= 0:
-                length = pattern.matchedLength()
-                self.setFormat(index, length, fmt)
-                index = pattern.indexIn(text, index + length)
-
-# ───────────────────────────── JavaScript 語法高亮 ────────────────────
-class JSHighlighter(QSyntaxHighlighter):
-    def __init__(self, document):
-        super().__init__(document)
-        self.highlightingRules = []
-        kwFmt = QTextCharFormat()
-        kwFmt.setForeground(QColor("#569cd6"))
-        kwFmt.setFontWeight(QFont.Bold)
-        for word in ['var', 'let', 'const', 'function', 'return', 'if', 'else',
-                     'for', 'while', 'class', 'import', 'export', 'from', 'new',
-                     'this', 'true', 'false', 'null', 'undefined', 'typeof',
-                     'async', 'await', 'try', 'catch', 'finally']:
-            self.highlightingRules.append((QRegExp(f"\\b{word}\\b"), kwFmt))
-        strFmt = QTextCharFormat()
-        strFmt.setForeground(QColor("#ce9178"))
-        for pattern in ['"[^"]*"', "'[^']*'", '`[^`]*`']:
-            self.highlightingRules.append((QRegExp(pattern), strFmt))
-        numFmt = QTextCharFormat()
-        numFmt.setForeground(QColor("#b5cea8"))
-        self.highlightingRules.append((QRegExp("\\b[0-9]+\\.?[0-9]*\\b"), numFmt))
-        commentFmt = QTextCharFormat()
-        commentFmt.setForeground(QColor("#6a9955"))
-        commentFmt.setFontItalic(True)
-        self.highlightingRules.append((QRegExp("//.*"), commentFmt))
+    def _re(self, pattern, color, bold=False, italic=False):
+        self.highlightingRules.append((QRegExp(pattern), self._fmt(color, bold, italic)))
 
     def highlightBlock(self, text):
         for pattern, fmt in self.highlightingRules:
@@ -400,39 +351,473 @@ class JSHighlighter(QSyntaxHighlighter):
                 self.setFormat(idx, pattern.matchedLength(), fmt)
                 idx = pattern.indexIn(text, idx + pattern.matchedLength())
 
-# ───────────────────────────── HTML 語法高亮 ──────────────────────────
-class HTMLHighlighter(QSyntaxHighlighter):
-    def __init__(self, document):
-        super().__init__(document)
-        self.highlightingRules = []
-        tagFmt = QTextCharFormat()
-        tagFmt.setForeground(QColor("#4ec9b0"))
-        self.highlightingRules.append((QRegExp("<[^>]+>"), tagFmt))
-        attrFmt = QTextCharFormat()
-        attrFmt.setForeground(QColor("#9cdcfe"))
-        self.highlightingRules.append((QRegExp("\\b\\w+(?==)"), attrFmt))
-        valFmt = QTextCharFormat()
-        valFmt.setForeground(QColor("#ce9178"))
-        self.highlightingRules.append((QRegExp('"[^"]*"'), valFmt))
-        commentFmt = QTextCharFormat()
-        commentFmt.setForeground(QColor("#6a9955"))
-        self.highlightingRules.append((QRegExp("<!--.*-->"), commentFmt))
+# ───────────────────────────── Python ────────────────────────────────
+class PythonHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['def','class','if','elif','else','try','except','finally',
+                  'while','for','in','import','from','as','return','with','pass',
+                  'break','continue','and','or','not','is','lambda',
+                  'True','False','None','yield','raise','del','global','nonlocal',
+                  'assert','async','await'])
+        self._kw(['print','len','range','enumerate','open','type','isinstance',
+                  'list','dict','set','tuple','int','str','float','bool',
+                  'super','self','zip','map','filter','sorted','reversed',
+                  'min','max','sum','abs','round','repr','id','hash',
+                  'getattr','setattr','hasattr','callable','staticmethod',
+                  'classmethod','property'], color="#dcdcaa", bold=False)
+        self._re("@\\w+", "#c586c0")                             # 裝飾器
+        self._re("\\b[0-9]+\\.?[0-9]*([eE][+-]?[0-9]+)?\\b", "#b5cea8")  # 數字
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")      # 雙引號字串
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")      # 單引號字串
+        self._re("#.*", "#6a9955", italic=True)                   # 註解
+        self._re("\\bdef\\s+\\w+", "#dcdcaa")                    # 函式名
+        self._re("\\bclass\\s+\\w+", "#4ec9b0")                  # 類別名
 
-    def highlightBlock(self, text):
-        for pattern, fmt in self.highlightingRules:
-            idx = pattern.indexIn(text)
-            while idx >= 0:
-                self.setFormat(idx, pattern.matchedLength(), fmt)
-                idx = pattern.indexIn(text, idx + pattern.matchedLength())
+# ───────────────────────────── JavaScript / TypeScript ───────────────
+class JSHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['var','let','const','function','return','if','else','for',
+                  'while','do','switch','case','break','continue','class',
+                  'import','export','from','new','delete','typeof','instanceof',
+                  'this','super','extends','implements','interface','enum',
+                  'try','catch','finally','throw','in','of','void',
+                  'true','false','null','undefined','NaN','Infinity',
+                  'async','await','yield','static','get','set',
+                  # TypeScript 額外
+                  'type','namespace','declare','abstract','readonly',
+                  'public','private','protected','as','keyof','infer'])
+        self._kw(['console','Math','Object','Array','String','Number','Boolean',
+                  'Promise','fetch','setTimeout','setInterval','Map','Set',
+                  'JSON','Date','Error','RegExp'], color="#dcdcaa", bold=False)
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re("`[^`]*`", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*.*\\*/", "#6a9955", italic=True)
+        self._re("\\b\\w+(?=\\s*\\()", "#dcdcaa")   # 函式呼叫
+        self._re(":[\\s]*[A-Z]\\w*", "#4ec9b0")     # 型別標注（TS）
 
+# ───────────────────────────── HTML / XML ────────────────────────────
+class HTMLHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re("<!--[^>]*-->", "#6a9955", italic=True)   # 註解（先處理）
+        self._re("</?[\\w:-]+", "#4ec9b0")                  # 標籤名
+        self._re(">", "#4ec9b0")
+        self._re("\\b[\\w:-]+(?=\\s*=)", "#9cdcfe")         # 屬性名
+        self._re('"[^"]*"', "#ce9178")                      # 屬性值
+        self._re("'[^']*'", "#ce9178")
+        self._re("&[a-zA-Z0-9#]+;", "#f48771")              # HTML 實體
+        self._re("<!DOCTYPE[^>]*>", "#808080")               # DOCTYPE
+
+# ───────────────────────────── CSS / SCSS / Less ──────────────────────
+class CSSHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)  # 區塊註解
+        self._re("//.*", "#6a9955", italic=True)             # 行內（SCSS/Less）
+        self._re("[.#][\\w-]+", "#d7ba7d")                   # class / id 選擇器
+        self._re("@[\\w-]+", "#c586c0")                      # at-rules / 變數
+        self._re("\\$[\\w-]+", "#9cdcfe")                    # SCSS 變數
+        self._re("--[\\w-]+", "#9cdcfe")                     # CSS 自訂變數
+        self._re("\\b[a-z-]+(?=\\s*:)", "#9cdcfe")           # 屬性名
+        self._re("#[0-9a-fA-F]{3,8}\\b", "#ce9178")          # 顏色值
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*(px|em|rem|vh|vw|%|pt|s|ms)?\\b", "#b5cea8")
+        self._kw(['important', 'inherit', 'initial', 'unset', 'none',
+                  'auto', 'normal', 'bold', 'italic', 'flex', 'grid',
+                  'block', 'inline', 'absolute', 'relative', 'fixed',
+                  'sticky', 'center', 'left', 'right', 'top', 'bottom'],
+                 color="#569cd6", bold=False)
+
+# ───────────────────────────── C / C++ ───────────────────────────────
+class CHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['auto','break','case','char','const','continue','default',
+                  'do','double','else','enum','extern','float','for','goto',
+                  'if','inline','int','long','register','restrict','return',
+                  'short','signed','sizeof','static','struct','switch',
+                  'typedef','union','unsigned','void','volatile','while',
+                  # C++ 額外
+                  'bool','class','delete','explicit','export','false',
+                  'friend','mutable','namespace','new','nullptr','operator',
+                  'private','protected','public','template','this','throw',
+                  'true','try','catch','typeid','typename','using','virtual',
+                  'override','final','constexpr','decltype','noexcept',
+                  'static_assert','thread_local','alignas','alignof'])
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*([uUlLfF]*)\\b", "#b5cea8")
+        self._re("0x[0-9a-fA-F]+", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("#\\s*(include|define|ifdef|ifndef|endif|pragma|undef|if|elif|else|error)", "#c586c0")
+        self._re("<[\\w./]+>", "#ce9178")                    # #include <...>
+        self._re("\\b[A-Z][A-Z0-9_]+\\b", "#b5cea8")        # 全大寫常數
+
+# ───────────────────────────── Java ──────────────────────────────────
+class JavaHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['abstract','assert','boolean','break','byte','case','catch',
+                  'char','class','const','continue','default','do','double',
+                  'else','enum','extends','final','finally','float','for',
+                  'goto','if','implements','import','instanceof','int',
+                  'interface','long','native','new','null','package','private',
+                  'protected','public','return','short','static','strictfp',
+                  'super','switch','synchronized','this','throw','throws',
+                  'transient','try','var','void','volatile','while',
+                  'true','false','record','sealed','permits','yield'])
+        self._kw(['System','String','Integer','Double','Boolean','List','Map',
+                  'Set','ArrayList','HashMap','Optional','Stream','Object',
+                  'Math','Arrays','Collections'], color="#4ec9b0", bold=False)
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*[lLfFdD]?\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("@\\w+", "#c586c0")                         # 注解 annotation
+
+# ───────────────────────────── C# ────────────────────────────────────
+class CSharpHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['abstract','as','base','bool','break','byte','case','catch',
+                  'char','checked','class','const','continue','decimal','default',
+                  'delegate','do','double','else','enum','event','explicit',
+                  'extern','false','finally','fixed','float','for','foreach',
+                  'goto','if','implicit','in','int','interface','internal',
+                  'is','lock','long','namespace','new','null','object','operator',
+                  'out','override','params','private','protected','public',
+                  'readonly','ref','return','sbyte','sealed','short','sizeof',
+                  'stackalloc','static','string','struct','switch','this','throw',
+                  'true','try','typeof','uint','ulong','unchecked','unsafe',
+                  'ushort','using','virtual','void','volatile','while',
+                  'async','await','var','dynamic','record','init','with',
+                  'global','file','required','scoped'])
+        self._re('@?"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*[uUlLfFdDmM]?\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("///.*", "#6a9955", italic=True)            # XML doc comment
+        self._re("\\[\\w+[^\\]]*\\]", "#c586c0")             # Attribute
+
+# ───────────────────────────── Go ────────────────────────────────────
+class GoHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['break','case','chan','const','continue','default','defer',
+                  'else','fallthrough','for','func','go','goto','if','import',
+                  'interface','map','package','range','return','select','struct',
+                  'switch','type','var',
+                  'true','false','nil','iota'])
+        self._kw(['append','cap','close','complex','copy','delete','imag',
+                  'len','make','new','panic','print','println','real',
+                  'recover','error','string','int','int8','int16','int32',
+                  'int64','uint','uint8','uint16','uint32','uint64','uintptr',
+                  'float32','float64','complex64','complex128','byte','rune',
+                  'bool'], color="#4ec9b0", bold=False)
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("`[^`]*`", "#ce9178")                       # raw string
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+
+# ───────────────────────────── Rust ──────────────────────────────────
+class RustHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['as','async','await','break','const','continue','crate',
+                  'dyn','else','enum','extern','false','fn','for','if',
+                  'impl','in','let','loop','match','mod','move','mut',
+                  'pub','ref','return','self','Self','static','struct',
+                  'super','trait','true','type','union','unsafe','use',
+                  'where','while','abstract','become','box','do','final',
+                  'macro','override','priv','try','typeof','unsized','virtual','yield'])
+        self._kw(['i8','i16','i32','i64','i128','isize',
+                  'u8','u16','u32','u64','u128','usize',
+                  'f32','f64','bool','char','str','String','Vec',
+                  'Option','Result','Box','Rc','Arc','HashMap','HashSet',
+                  'println','print','eprintln','panic','assert','assert_eq',
+                  'todo','unimplemented','unreachable'],
+                 color="#4ec9b0", bold=False)
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("b\"[^\"]*\"", "#ce9178")                   # byte string
+        self._re("\\b[0-9]+\\.?[0-9]*(_[a-z0-9]+)?\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("#!?\\[[^\\]]*\\]", "#c586c0")              # Attribute
+        self._re("'[a-zA-Z_]\\w*", "#569cd6")               # lifetime
+
+# ───────────────────────────── Ruby ──────────────────────────────────
+class RubyHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['BEGIN','END','alias','and','begin','break','case','class',
+                  'def','defined?','do','else','elsif','end','ensure',
+                  'false','for','if','in','module','next','nil','not',
+                  'or','redo','rescue','retry','return','self','super',
+                  'then','true','undef','unless','until','when','while','yield',
+                  '__FILE__','__LINE__','__method__','__dir__'])
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("%[qQwWiI]?[{(\\[|!][^})|!]*[})|!]", "#ce9178")  # %q{} 字串
+        self._re(":[a-zA-Z_]\\w*", "#569cd6")               # symbol
+        self._re("@{1,2}[a-zA-Z_]\\w*", "#9cdcfe")          # @var / @@var
+        self._re("\\$[a-zA-Z_]\\w*", "#c586c0")              # $global
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("#.*", "#6a9955", italic=True)
+        self._re("=begin.*=end", "#6a9955", italic=True)
+
+# ───────────────────────────── PHP ───────────────────────────────────
+class PHPHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['abstract','and','array','as','break','callable','case',
+                  'catch','class','clone','const','continue','declare',
+                  'default','die','do','echo','else','elseif','empty',
+                  'enddeclare','endfor','endforeach','endif','endswitch',
+                  'endwhile','eval','exit','extends','final','finally',
+                  'fn','for','foreach','function','global','goto','if',
+                  'implements','include','include_once','instanceof',
+                  'insteadof','interface','isset','list','match','namespace',
+                  'new','null','or','print','private','protected','public',
+                  'readonly','require','require_once','return','static',
+                  'switch','throw','trait','try','true','false','unset',
+                  'use','var','while','xor','yield'])
+        self._re("\\$[a-zA-Z_]\\w*", "#9cdcfe")             # 變數
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("<<<['\"]?\\w+['\"]?", "#ce9178")           # heredoc
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("#.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("<\\?php|\\?>", "#c586c0")                  # PHP 標籤
+
+# ───────────────────────────── Shell / Bash ───────────────────────────
+class ShellHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['if','then','else','elif','fi','for','while','do','done',
+                  'case','esac','function','return','in','until',
+                  'break','continue','exit','local','export','source',
+                  'true','false','null'])
+        self._kw(['echo','printf','read','cd','ls','pwd','mkdir','rm','cp',
+                  'mv','cat','grep','sed','awk','find','sort','uniq','wc',
+                  'chmod','chown','sudo','apt','yum','pip','python3',
+                  'git','curl','wget','tar','zip','unzip'],
+                 color="#dcdcaa", bold=False)
+        self._re("\\$[{(]?[a-zA-Z_][\\w]*[})]?", "#9cdcfe") # 變數
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re("`[^`]*`", "#c586c0")                      # 命令替換
+        self._re("#.*", "#6a9955", italic=True)
+        self._re("\\b[0-9]+\\b", "#b5cea8")
+        self._re("&&|\\|\\||>>?|<<", "#c586c0")             # 運算子
+
+# ───────────────────────────── SQL ───────────────────────────────────
+class SQLHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['SELECT','FROM','WHERE','INSERT','INTO','VALUES','UPDATE',
+                  'SET','DELETE','CREATE','TABLE','DROP','ALTER','ADD',
+                  'COLUMN','INDEX','VIEW','DATABASE','SCHEMA','GRANT',
+                  'REVOKE','COMMIT','ROLLBACK','BEGIN','TRANSACTION',
+                  'JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
+                  'ON','AS','AND','OR','NOT','IN','IS','NULL','LIKE',
+                  'BETWEEN','EXISTS','UNION','ALL','DISTINCT','GROUP',
+                  'BY','ORDER','HAVING','LIMIT','OFFSET','ASC','DESC',
+                  'PRIMARY','KEY','FOREIGN','REFERENCES','UNIQUE',
+                  'DEFAULT','CHECK','CONSTRAINT','RETURNING','WITH',
+                  # 小寫也支援
+                  'select','from','where','insert','into','values','update',
+                  'set','delete','create','table','drop','alter','join',
+                  'left','right','inner','outer','on','as','and','or','not',
+                  'in','is','null','like','between','exists','union',
+                  'group','by','order','having','limit','offset'])
+        self._kw(['COUNT','SUM','AVG','MIN','MAX','COALESCE','NULLIF',
+                  'CAST','CONVERT','CONCAT','LENGTH','SUBSTR','UPPER',
+                  'LOWER','TRIM','NOW','DATE','YEAR','MONTH','DAY',
+                  'count','sum','avg','min','max','coalesce'],
+                 color="#dcdcaa", bold=False)
+        self._re("'[^']*'", "#ce9178")
+        self._re('"[^"]*"', "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("--.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+
+# ───────────────────────────── JSON ──────────────────────────────────
+class JSONHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"\\s*:', "#9cdcfe")  # key
+        self._re(':\\s*"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")  # string value
+        self._re("\\b(true|false|null)\\b", "#569cd6")
+        self._re(":\\s*-?[0-9]+\\.?[0-9]*([eE][+-]?[0-9]+)?", "#b5cea8")
+
+# ───────────────────────────── YAML ──────────────────────────────────
+class YAMLHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re("^---", "#c586c0")                          # document start
+        self._re("^\\s*[\\w-]+\\s*:", "#9cdcfe")            # key
+        self._re(":\\s*.+", "#ce9178")                       # value
+        self._re("^\\s*- ", "#569cd6")                       # list item
+        self._re("&\\w+|\\*\\w+", "#4ec9b0")                # anchor / alias
+        self._re("!\\w+", "#c586c0")                         # tag
+        self._re("#.*", "#6a9955", italic=True)
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re("\\b(true|false|null|yes|no|on|off)\\b", "#569cd6")
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+
+# ───────────────────────────── Markdown ──────────────────────────────
+class MarkdownHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re("^#{1,6}\\s.*", "#569cd6", bold=True)       # 標題
+        self._re("\\*\\*[^*]+\\*\\*", "#dcdcaa", bold=True)  # **粗體**
+        self._re("\\*[^*]+\\*", "#ce9178", italic=True)       # *斜體*
+        self._re("__[^_]+__", "#dcdcaa", bold=True)
+        self._re("_[^_]+_", "#ce9178", italic=True)
+        self._re("`[^`]+`", "#4ec9b0")                        # `行內程式碼`
+        self._re("^```.*", "#c586c0")                          # 程式碼區塊標記
+        self._re("^>.*", "#6a9955", italic=True)              # 引用
+        self._re("^\\s*[-*+]\\s", "#569cd6")                  # 列表
+        self._re("^\\s*[0-9]+\\.\\s", "#569cd6")             # 有序列表
+        self._re("\\[([^\\]]+)\\]\\([^)]+\\)", "#4ec9b0")    # 連結
+        self._re("!\\[([^\\]]+)\\]\\([^)]+\\)", "#c586c0")   # 圖片
+        self._re("^---+$", "#808080")                          # 分隔線
+
+# ───────────────────────────── Kotlin ────────────────────────────────
+class KotlinHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['abstract','actual','annotation','as','break','by','catch',
+                  'class','companion','const','constructor','continue',
+                  'crossinline','data','delegate','do','dynamic','else',
+                  'enum','expect','external','false','field','file','final',
+                  'finally','for','fun','get','if','import','in','infix',
+                  'init','inline','inner','interface','internal','is',
+                  'it','lateinit','noinline','null','object','open',
+                  'operator','out','override','package','param','private',
+                  'property','protected','public','receiver','reified',
+                  'return','sealed','set','setparam','super','suspend',
+                  'tailrec','this','throw','true','try','typealias',
+                  'typeof','val','value','var','vararg','when','where','while'])
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re('"""[^"]*"""', "#ce9178")                   # triple-quoted
+        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*[LFf]?\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("@\\w+", "#c586c0")
+
+# ───────────────────────────── Swift ─────────────────────────────────
+class SwiftHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['associatedtype','class','deinit','enum','extension',
+                  'fileprivate','func','import','init','inout','internal',
+                  'let','open','operator','precedencegroup','private',
+                  'protocol','public','rethrows','static','struct',
+                  'subscript','typealias','var','break','case','catch',
+                  'continue','default','defer','do','else','fallthrough',
+                  'for','guard','if','in','repeat','return','throw',
+                  'switch','where','while','Any','as','false','is',
+                  'nil','rethrows','self','Self','super','throw','throws',
+                  'true','try','async','await','actor','nonisolated',
+                  'some','any','consuming','borrowing'])
+        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
+        self._re('"""[^"]*"""', "#ce9178")
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("//.*", "#6a9955", italic=True)
+        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re("@\\w+", "#c586c0")                         # property wrapper
+
+# ───────────────────────────── Dockerfile ────────────────────────────
+class DockerHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._kw(['FROM','RUN','CMD','LABEL','EXPOSE','ENV','ADD','COPY',
+                  'ENTRYPOINT','VOLUME','USER','WORKDIR','ARG','ONBUILD',
+                  'STOPSIGNAL','HEALTHCHECK','SHELL',
+                  'from','run','cmd','label','expose','env','add','copy',
+                  'entrypoint','volume','user','workdir','arg'])
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re("#.*", "#6a9955", italic=True)
+        self._re("\\$[{]?[a-zA-Z_]\\w*[}]?", "#9cdcfe")
+
+# ───────────────────────────── TOML ──────────────────────────────────
+class TOMLHighlighter(BaseHighlighter):
+    def _setup_rules(self):
+        self._re("^\\[+[^\\]]+\\]+", "#569cd6", bold=True)  # [section]
+        self._re("^\\s*[\\w.-]+\\s*=", "#9cdcfe")           # key
+        self._re('"[^"]*"', "#ce9178")
+        self._re("'[^']*'", "#ce9178")
+        self._re('"""[^"]*"""', "#ce9178")
+        self._re("\\b(true|false)\\b", "#569cd6")
+        self._re("\\b[0-9]{4}-[0-9]{2}-[0-9]{2}", "#4ec9b0") # date
+        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+        self._re("#.*", "#6a9955", italic=True)
+
+# ══════════════════════════════════════════════════════════════════════
+#  根據副檔名選擇高亮器
+# ══════════════════════════════════════════════════════════════════════
 def get_highlighter_for_file(path, document):
     ext = QFileInfo(path).suffix().lower()
-    if ext in ('js', 'ts', 'jsx', 'tsx'):
-        return JSHighlighter(document)
-    elif ext in ('html', 'htm', 'xml'):
-        return HTMLHighlighter(document)
-    else:
-        return PythonHighlighter(document)
+    name = QFileInfo(path).fileName().lower()
+
+    MAP = {
+        # Python
+        ('py', 'pyw', 'pyi'): PythonHighlighter,
+        # JavaScript / TypeScript
+        ('js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx'): JSHighlighter,
+        # HTML / XML
+        ('html', 'htm', 'xml', 'xhtml', 'svg'): HTMLHighlighter,
+        # CSS / SCSS / Less
+        ('css', 'scss', 'sass', 'less'): CSSHighlighter,
+        # C / C++
+        ('c', 'h', 'cpp', 'cxx', 'cc', 'hpp', 'hxx'): CHighlighter,
+        # Java
+        ('java',): JavaHighlighter,
+        # C#
+        ('cs',): CSharpHighlighter,
+        # Go
+        ('go',): GoHighlighter,
+        # Rust
+        ('rs',): RustHighlighter,
+        # Ruby
+        ('rb', 'rake', 'gemspec'): RubyHighlighter,
+        # PHP
+        ('php', 'php3', 'php4', 'php5', 'phtml'): PHPHighlighter,
+        # Shell
+        ('sh', 'bash', 'zsh', 'fish', 'ksh'): ShellHighlighter,
+        # SQL
+        ('sql',): SQLHighlighter,
+        # JSON
+        ('json', 'jsonc'): JSONHighlighter,
+        # YAML
+        ('yaml', 'yml'): YAMLHighlighter,
+        # Markdown
+        ('md', 'markdown', 'mdx'): MarkdownHighlighter,
+        # Kotlin
+        ('kt', 'kts'): KotlinHighlighter,
+        # Swift
+        ('swift',): SwiftHighlighter,
+        # Dockerfile
+        ('dockerfile',): DockerHighlighter,
+        # TOML
+        ('toml',): TOMLHighlighter,
+    }
+
+    # 無副檔名特殊檔名（如 Dockerfile、Makefile）
+    NAMEMAP = {
+        'dockerfile': DockerHighlighter,
+        'makefile': ShellHighlighter,
+        '.bashrc': ShellHighlighter,
+        '.zshrc': ShellHighlighter,
+        '.gitignore': ShellHighlighter,
+    }
+    if name in NAMEMAP:
+        return NAMEMAP[name](document)
+
+    for exts, cls in MAP.items():
+        if ext in exts:
+            return cls(document)
+
+    return PythonHighlighter(document)  # 預設
 
 # ───────────────────────────── Git 對話框 ─────────────────────────────
 class GitDialog(QDialog):
