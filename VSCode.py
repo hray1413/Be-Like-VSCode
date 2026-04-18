@@ -3,8 +3,8 @@ import re
 import subprocess
 import os
 import json
-from PyQt5.QtCore import (Qt, QDir, QRegExp, QSize, QFileInfo, QProcess,
-                           QTimer, QSettings)
+from PyQt5.QtCore import (Qt, QDir, QSize, QFileInfo, QProcess,
+                           QTimer, QSettings, QThread, pyqtSignal)
 from PyQt5.QtGui import (QColor, QSyntaxHighlighter, QTextCharFormat, QPainter,
                          QTextFormat, QPalette, QTextCursor, QFont, QKeySequence,
                          QFontMetrics)
@@ -591,42 +591,121 @@ class CodeEditor(QPlainTextEdit):
             blockNumber += 1
 
 # ══════════════════════════════════════════════════════════════════════
-#  通用基礎高亮器：子類只需填 rules，highlightBlock 共用
+#  非同步語法高亮架構
+#
+#  小檔（< SYNC_THRESHOLD 行）→ 直接在主執行緒 highlightBlock() 同步高亮
+#  大檔                       → HighlightWorker（QThread）在背景跑 re，
+#                               算完後 signal 通知 BaseHighlighter 套用結果
 # ══════════════════════════════════════════════════════════════════════
+SYNC_THRESHOLD = 500   # 行數門檻，低於此值同步高亮
+
+# ── 格式描述（可跨 thread 傳遞的純資料）─────────────────────────────
+# 每條 rule 用 Python re.compile 物件 + 顏色字串儲存
+class _Rule:
+    __slots__ = ('pattern', 'color', 'bold', 'italic')
+    def __init__(self, pattern, color, bold=False, italic=False):
+        self.pattern = pattern
+        self.color   = color
+        self.bold    = bold
+        self.italic  = italic
+
+# ── 背景 Worker ───────────────────────────────────────────────────────
+class HighlightWorker(QThread):
+    """
+    在子執行緒中對整份文字跑 re，產出
+      results: list[ list[ (start, length, color, bold, italic) ] ]
+    每個外層元素對應一行。
+    """
+    results_ready = pyqtSignal(list)   # 算完後發給 highlighter
+
+    def __init__(self, text, rules, parent=None):
+        super().__init__(parent)
+        self._text  = text
+        self._rules = rules        # list[_Rule]
+
+    def run(self):
+        lines = self._text.split('\n')
+        output = []
+        for line in lines:
+            spans = []
+            for rule in self._rules:
+                for m in rule.pattern.finditer(line):
+                    spans.append((m.start(), m.end() - m.start(),
+                                  rule.color, rule.bold, rule.italic))
+            output.append(spans)
+        self.results_ready.emit(output)
+
+# ── 基礎高亮器 ────────────────────────────────────────────────────────
 class BaseHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
-        self.highlightingRules = []
+        self._rules: list[_Rule] = []
+        self._async_data: list[list] = []   # Worker 回傳結果快取
+        self._worker: HighlightWorker | None = None
         self._setup_rules()
+        # 監聽文字變動，大檔時啟動背景 Worker
+        document.contentsChanged.connect(self._on_contents_changed)
 
     def _setup_rules(self):
-        pass  # 子類覆寫
+        pass  # 子類覆寫，呼叫 _kw() / _re()
 
-    # 快速建立格式
+    # ── 快速格式建立 ──
     @staticmethod
-    def _fmt(color, bold=False, italic=False):
+    def _make_fmt(color, bold=False, italic=False):
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
-        if bold:
-            fmt.setFontWeight(QFont.Bold)
-        if italic:
-            fmt.setFontItalic(True)
+        if bold:   fmt.setFontWeight(QFont.Bold)
+        if italic: fmt.setFontItalic(True)
         return fmt
 
     def _kw(self, words, color="#569cd6", bold=True):
-        fmt = self._fmt(color, bold=bold)
         for w in words:
-            self.highlightingRules.append((QRegExp(f"\\b{w}\\b"), fmt))
+            pat = re.compile(rf"\b{re.escape(w)}\b")
+            self._rules.append(_Rule(pat, color, bold=bold))
 
     def _re(self, pattern, color, bold=False, italic=False):
-        self.highlightingRules.append((QRegExp(pattern), self._fmt(color, bold, italic)))
+        pat = re.compile(pattern)
+        self._rules.append(_Rule(pat, color, bold=bold, italic=italic))
 
+    # ── 文字變動時決定同步 or 非同步 ──
+    def _on_contents_changed(self):
+        doc = self.document()
+        if doc is None:
+            return
+        line_count = doc.blockCount()
+        if line_count >= SYNC_THRESHOLD:
+            self._start_worker(doc.toPlainText())
+
+    def _start_worker(self, text):
+        # 如果前一個 Worker 還在跑，先停掉
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(200)
+        self._worker = HighlightWorker(text, self._rules, self)
+        self._worker.results_ready.connect(self._on_results_ready)
+        self._worker.start()
+
+    def _on_results_ready(self, data):
+        self._async_data = data
+        # 通知 Qt 重新高亮所有區塊
+        self.rehighlight()
+
+    # ── Qt 每次渲染一行時呼叫 ──
     def highlightBlock(self, text):
-        for pattern, fmt in self.highlightingRules:
-            idx = pattern.indexIn(text)
-            while idx >= 0:
-                self.setFormat(idx, pattern.matchedLength(), fmt)
-                idx = pattern.indexIn(text, idx + pattern.matchedLength())
+        block_num = self.currentBlock().blockNumber()
+        line_count = self.document().blockCount()
+
+        if line_count >= SYNC_THRESHOLD and self._async_data:
+            # 大檔：從快取取預算好的結果直接套用，速度極快
+            if block_num < len(self._async_data):
+                for start, length, color, bold, italic in self._async_data[block_num]:
+                    self.setFormat(start, length, self._make_fmt(color, bold, italic))
+        else:
+            # 小檔：同步直接跑 re（低延遲，不需要 thread overhead）
+            for rule in self._rules:
+                for m in rule.pattern.finditer(text):
+                    self.setFormat(m.start(), m.end() - m.start(),
+                                   self._make_fmt(rule.color, rule.bold, rule.italic))
 
 # ───────────────────────────── Python ────────────────────────────────
 class PythonHighlighter(BaseHighlighter):
