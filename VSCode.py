@@ -23,54 +23,141 @@ class SearchDialog(QDialog):
         super().__init__()
         self.editor = editor
         self.setWindowTitle("搜尋文字")
+        self.setMinimumWidth(480)
+        self._main_window = None  # 快取，避免重複查找
+
         layout = QVBoxLayout()
+
+        # 輸入列
+        input_row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("輸入要搜尋的文字…")
+        self.search_input.setPlaceholderText("輸入關鍵字或正則表達式…")
+        self.search_input.returnPressed.connect(self.find_text)
+        input_row.addWidget(self.search_input)
+        search_btn = QPushButton("搜尋")
+        search_btn.clicked.connect(self.find_text)
+        input_row.addWidget(search_btn)
+        layout.addLayout(input_row)
+
+        # 選項列
+        option_row = QHBoxLayout()
+        self.chk_regex = QCheckBox("正則表達式 (Regex)")
+        self.chk_case  = QCheckBox("區分大小寫")
+        self.chk_word  = QCheckBox("完整單字")
+        option_row.addWidget(self.chk_regex)
+        option_row.addWidget(self.chk_case)
+        option_row.addWidget(self.chk_word)
+        option_row.addStretch()
+        layout.addLayout(option_row)
+
+        # 錯誤提示（平常隱藏）
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #f48771;")
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+
+        # 結果計數
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet("color: #858585; font-size: 12px;")
+        layout.addWidget(self.count_label)
+
+        # 結果列表
         self.result_list = QListWidget()
-        self.search_button = QPushButton("搜尋")
-        self.search_button.clicked.connect(self.find_text)
-        layout.addWidget(QLabel("關鍵字："))
-        layout.addWidget(self.search_input)
-        layout.addWidget(self.search_button)
+        self.result_list.itemClicked.connect(self._on_item_clicked)
         layout.addWidget(self.result_list)
+
         self.setLayout(layout)
+
+    def _get_main_window(self):
+        if self._main_window:
+            return self._main_window
+        parent = self.parentWidget() or self.editor.parentWidget()
+        if parent and hasattr(parent, 'parentWidget'):
+            self._main_window = parent.parentWidget()
+        return self._main_window
+
+    def _build_pattern(self, keyword):
+        """根據選項建立 re pattern，回傳 (pattern, error_msg)。"""
+        flags = 0 if self.chk_case.isChecked() else re.IGNORECASE
+
+        if self.chk_regex.isChecked():
+            try:
+                pattern = re.compile(keyword, flags)
+            except re.error as e:
+                return None, f"Regex 錯誤：{e}"
+        else:
+            escaped = re.escape(keyword)
+            if self.chk_word.isChecked():
+                escaped = rf"\b{escaped}\b"
+            pattern = re.compile(escaped, flags)
+
+        return pattern, None
 
     def find_text(self):
         self.result_list.clear()
+        self.error_label.hide()
+        self.count_label.setText("")
+
         keyword = self.search_input.text()
         if not keyword:
             return
-        parent = self.parentWidget()
-        if not parent:
-            parent = self.editor.parentWidget()
-        if not hasattr(parent, 'parentWidget'):
+
+        pattern, err = self._build_pattern(keyword)
+        if err:
+            self.error_label.setText(err)
+            self.error_label.show()
             return
-        main_window = parent.parentWidget()
+
+        main_window = self._get_main_window()
         if not main_window:
             return
+
+        total = 0
         for tab_index in range(main_window.tabs.count()):
             tab = main_window.tabs.widget(tab_index)
             editor = main_window.editor_widgets.get(tab)
-            if editor:
-                lines = editor.toPlainText().split('\n')
-                for line_num, line in enumerate(lines, start=1):
-                    if keyword in line:
-                        file_name = getattr(tab, 'file_path', '未命名')
-                        file_name = QFileInfo(file_name).fileName()
-                        item_text = f"{file_name}: 第 {line_num} 行: {line.strip()}"
-                        item = QListWidgetItem(item_text)
-                        item.setData(Qt.UserRole, (tab_index, line_num))
-                        self.result_list.addItem(item)
-        self.result_list.itemClicked.connect(lambda item: self.go_to_result(item, main_window))
+            if not editor:
+                continue
+            lines = editor.toPlainText().split('\n')
+            for line_num, line in enumerate(lines, start=1):
+                matches = list(pattern.finditer(line))
+                if not matches:
+                    continue
+                total += len(matches)
+                file_name = QFileInfo(getattr(tab, 'file_path', '未命名')).fileName()
+                # 標示每個符合位置（col）
+                cols = ", ".join(f"欄{m.start()+1}" for m in matches)
+                item_text = f"{file_name}  第 {line_num} 行  [{cols}]：{line.strip()}"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, (tab_index, line_num, matches[0].start()))
+                self.result_list.addItem(item)
 
-    def go_to_result(self, item, main_window):
-        tab_index, line_num = item.data(Qt.UserRole)
+        self.count_label.setText(f"共找到 {total} 個符合，{self.result_list.count()} 行")
+
+    def _on_item_clicked(self, item):
+        main_window = self._get_main_window()
+        if not main_window:
+            return
+        tab_index, line_num, col = item.data(Qt.UserRole)
         main_window.tabs.setCurrentIndex(tab_index)
         editor = main_window.editor_widgets[main_window.tabs.widget(tab_index)]
+
+        # 移到對應行並高亮該行的符合文字
         cursor = editor.textCursor()
         cursor.movePosition(QTextCursor.Start)
         for _ in range(line_num - 1):
             cursor.movePosition(QTextCursor.Down)
+        cursor.movePosition(QTextCursor.StartOfLine)
+        cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, col)
+
+        # 選取符合的文字長度
+        keyword = self.search_input.text()
+        pattern, _ = self._build_pattern(keyword)
+        line_text = editor.document().findBlockByLineNumber(line_num - 1).text()
+        m = pattern.search(line_text, col)
+        if m:
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(m.group()))
+
         editor.setTextCursor(cursor)
         editor.setFocus()
 
