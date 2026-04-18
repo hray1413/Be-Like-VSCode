@@ -166,25 +166,123 @@ class ReplaceDialog(QDialog):
     def __init__(self, editor):
         super().__init__()
         self.editor = editor
-        self.setWindowTitle("取代文字")
+        self.setWindowTitle("搜尋與取代")
+        self.setMinimumWidth(480)
+
         layout = QVBoxLayout()
-        self.search_input = QLineEdit()
-        self.replace_input = QLineEdit()
-        self.replace_button = QPushButton("全部取代")
-        self.replace_button.clicked.connect(self.replace_text)
+
+        # 搜尋輸入
         layout.addWidget(QLabel("搜尋："))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("輸入關鍵字或正則表達式…")
         layout.addWidget(self.search_input)
+
+        # 取代輸入
         layout.addWidget(QLabel("取代為："))
+        self.replace_input = QLineEdit()
+        self.replace_input.setPlaceholderText("取代內容（Regex 模式可用 \\1 回參）")
         layout.addWidget(self.replace_input)
-        layout.addWidget(self.replace_button)
+
+        # 選項列
+        opt_row = QHBoxLayout()
+        self.chk_regex = QCheckBox("正則表達式")
+        self.chk_case  = QCheckBox("區分大小寫")
+        self.chk_word  = QCheckBox("完整單字")
+        opt_row.addWidget(self.chk_regex)
+        opt_row.addWidget(self.chk_case)
+        opt_row.addWidget(self.chk_word)
+        opt_row.addStretch()
+        layout.addLayout(opt_row)
+
+        # 錯誤 / 結果提示
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #858585; font-size: 12px;")
+        layout.addWidget(self.info_label)
+
+        # 按鈕列
+        btn_row = QHBoxLayout()
+        btn_find    = QPushButton("找下一個")
+        btn_replace = QPushButton("取代")
+        btn_all     = QPushButton("全部取代")
+        btn_find.clicked.connect(self.find_next)
+        btn_replace.clicked.connect(self.replace_one)
+        btn_all.clicked.connect(self.replace_all)
+        btn_row.addWidget(btn_find)
+        btn_row.addWidget(btn_replace)
+        btn_row.addWidget(btn_all)
+        layout.addLayout(btn_row)
+
         self.setLayout(layout)
 
-    def replace_text(self):
-        search = self.search_input.text()
+    def _build_pattern(self, keyword):
+        flags = 0 if self.chk_case.isChecked() else re.IGNORECASE
+        if self.chk_regex.isChecked():
+            try:
+                return re.compile(keyword, flags), None
+            except re.error as e:
+                return None, f"Regex 錯誤：{e}"
+        escaped = re.escape(keyword)
+        if self.chk_word.isChecked():
+            escaped = rf"\b{escaped}\b"
+        return re.compile(escaped, flags), None
+
+    def find_next(self):
+        keyword = self.search_input.text()
+        if not keyword:
+            return False
+        pattern, err = self._build_pattern(keyword)
+        if err:
+            self.info_label.setText(err)
+            return False
+
+        full_text = self.editor.toPlainText()
+        cursor = self.editor.textCursor()
+        start = cursor.selectionEnd()
+        m = pattern.search(full_text, start)
+        if not m:
+            m = pattern.search(full_text)  # 從頭繞回
+        if m:
+            c = self.editor.textCursor()
+            c.setPosition(m.start())
+            c.setPosition(m.end(), QTextCursor.KeepAnchor)
+            self.editor.setTextCursor(c)
+            self.info_label.setText("")
+            return True
+        self.info_label.setText("找不到符合內容")
+        return False
+
+    def replace_one(self):
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            self.find_next()
+            return
+        keyword = self.search_input.text()
         replace = self.replace_input.text()
-        if search:
-            text = self.editor.toPlainText().replace(search, replace)
-            self.editor.setPlainText(text)
+        pattern, err = self._build_pattern(keyword)
+        if err:
+            self.info_label.setText(err)
+            return
+        selected = cursor.selectedText()
+        new_text = pattern.sub(replace, selected, count=1)
+        cursor.insertText(new_text)
+        self.find_next()
+
+    def replace_all(self):
+        keyword = self.search_input.text()
+        replace = self.replace_input.text()
+        if not keyword:
+            return
+        pattern, err = self._build_pattern(keyword)
+        if err:
+            self.info_label.setText(err)
+            return
+        original = self.editor.toPlainText()
+        new_text, count = pattern.subn(replace, original)
+        if count:
+            self.editor.setPlainText(new_text)
+            self.info_label.setText(f"已取代 {count} 處")
+        else:
+            self.info_label.setText("找不到符合內容")
 
 # ───────────────────────────── 終端機 ─────────────────────────────────
 class TerminalWidget(QTextEdit):
@@ -274,10 +372,30 @@ class CodeEditor(QPlainTextEdit):
                 event.ignore()
                 return
 
-        if event.key() == Qt.Key_Tab:
-            self.insertPlainText("    ")
+        # Ctrl+/ — 切換行註解
+        if event.key() == Qt.Key_Slash and event.modifiers() == Qt.ControlModifier:
+            self._toggle_comment()
             return
 
+        # Ctrl+D — 選取下一個相同文字
+        if event.key() == Qt.Key_D and event.modifiers() == Qt.ControlModifier:
+            self._select_next_occurrence()
+            return
+
+        # Tab / Shift+Tab — 整段縮排 / 反縮排
+        if event.key() == Qt.Key_Tab:
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                self._indent_selection(dedent=False)
+            else:
+                self.insertPlainText("    ")
+            return
+
+        if event.key() == Qt.Key_Backtab:
+            self._indent_selection(dedent=True)
+            return
+
+        # 自動配對括號
         pairs = {'(': ')', '[': ']', '{': '}', '"': '"', "'": "'"}
         if event.text() in pairs:
             super().keyPressEvent(event)
@@ -289,6 +407,7 @@ class CodeEditor(QPlainTextEdit):
 
         super().keyPressEvent(event)
 
+        # 自動完成觸發
         if event.text().isalpha() or event.text() == '_':
             cursor = self.textCursor()
             cursor.select(QTextCursor.WordUnderCursor)
@@ -306,6 +425,77 @@ class CodeEditor(QPlainTextEdit):
                 self.completer.popup().hide()
         else:
             self.completer.popup().hide()
+
+    # ── 整段縮排 / 反縮排 ──
+    def _indent_selection(self, dedent=False):
+        cursor = self.textCursor()
+        start = cursor.selectionStart()
+        end   = cursor.selectionEnd()
+
+        cursor.setPosition(start)
+        cursor.movePosition(QTextCursor.StartOfLine)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+
+        lines = cursor.selectedText().split('\u2029')  # Qt 段落分隔符
+        new_lines = []
+        for line in lines:
+            if dedent:
+                if line.startswith('    '):
+                    new_lines.append(line[4:])
+                elif line.startswith('\t'):
+                    new_lines.append(line[1:])
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append('    ' + line)
+        cursor.insertText('\u2029'.join(new_lines))
+
+    # ── 切換行註解 Ctrl+/ ──
+    def _toggle_comment(self):
+        cursor = self.textCursor()
+        start = cursor.selectionStart()
+        end   = cursor.selectionEnd()
+
+        cursor.setPosition(start)
+        cursor.movePosition(QTextCursor.StartOfLine)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+
+        lines = cursor.selectedText().split('\u2029')
+        # 如果全部都有 # 就取消，否則加上
+        all_commented = all(l.lstrip().startswith('#') for l in lines if l.strip())
+        new_lines = []
+        for line in lines:
+            if all_commented:
+                # 移除第一個 # （保留縮排）
+                stripped = line.lstrip()
+                indent = line[:len(line) - len(stripped)]
+                new_lines.append(indent + stripped[1:].lstrip() if stripped.startswith('#') else line)
+            else:
+                new_lines.append('# ' + line)
+        cursor.insertText('\u2029'.join(new_lines))
+
+    # ── Ctrl+D 選取下一個相同文字 ──
+    def _select_next_occurrence(self):
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            cursor.select(QTextCursor.WordUnderCursor)
+            self.setTextCursor(cursor)
+            return
+
+        word = cursor.selectedText()
+        if not word:
+            return
+
+        doc = self.document()
+        # 從目前選取結尾往後找
+        search_cursor = doc.find(word, cursor.selectionEnd())
+        if search_cursor.isNull():
+            # 繞回從頭找
+            search_cursor = doc.find(word, 0)
+        if not search_cursor.isNull():
+            self.setTextCursor(search_cursor)
 
     def highlight_brackets(self):
         selections = []
@@ -1025,11 +1215,19 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "離開", self.close, "Ctrl+Q")
 
         edit_menu = menubar.addMenu("編輯")
+        self._add_action(edit_menu, "復原", self.undo, "Ctrl+Z")
+        self._add_action(edit_menu, "取消復原", self.redo, "Ctrl+Y")
+        edit_menu.addSeparator()
         self._add_action(edit_menu, "搜尋", self.open_search, "Ctrl+F")
         self._add_action(edit_menu, "取代", self.open_replace, "Ctrl+H")
         edit_menu.addSeparator()
         self._add_action(edit_menu, "跳到指定行", self.goto_line, "Ctrl+L")
         self._add_action(edit_menu, "全選", lambda: self._current_editor() and self._current_editor().selectAll(), "Ctrl+A")
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, "縮排選取", lambda: self._current_editor() and self._current_editor()._indent_selection(False), "Tab")
+        self._add_action(edit_menu, "反縮排選取", lambda: self._current_editor() and self._current_editor()._indent_selection(True), "Shift+Tab")
+        self._add_action(edit_menu, "切換行註解", lambda: self._current_editor() and self._current_editor()._toggle_comment(), "Ctrl+/")
+        self._add_action(edit_menu, "選取下一個相同文字", lambda: self._current_editor() and self._current_editor()._select_next_occurrence(), "Ctrl+D")
 
         view_menu = menubar.addMenu("檢視")
         self._add_action(view_menu, "放大字型", self.zoom_in, "Ctrl++")
@@ -1054,6 +1252,8 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         for label, slot in [
             ("新增", self.new_file), ("開啟", self.open_file), ("儲存", self.save_file),
+            ("|", None),
+            ("↩ 復原", self.undo), ("↪ 取消復原", self.redo),
             ("|", None),
             ("搜尋", self.open_search), ("取代", self.open_replace),
             ("|", None),
@@ -1240,6 +1440,16 @@ class MainWindow(QMainWindow):
             action.setToolTip(path)
             action.triggered.connect(lambda _, p=path: self.open_file(p))
             self.recent_menu.addAction(action)
+
+    def undo(self):
+        editor = self._current_editor()
+        if editor:
+            editor.undo()
+
+    def redo(self):
+        editor = self._current_editor()
+        if editor:
+            editor.redo()
 
     def open_search(self):
         editor = self._current_editor()
