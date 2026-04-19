@@ -1,30 +1,78 @@
-import sys
+from __future__ import annotations
+
+import os
 import re
 import subprocess
-import os
-import json
-from PyQt5.QtCore import (Qt, QDir, QSize, QFileInfo, QProcess,
-                           QTimer, QSettings, QThread, pyqtSignal)
-from PyQt5.QtGui import (QColor, QSyntaxHighlighter, QTextCharFormat, QPainter,
-                         QTextFormat, QPalette, QTextCursor, QFont, QKeySequence,
-                         QFontMetrics)
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QSplitter, QTreeView, QPlainTextEdit,
-    QTabWidget, QFileSystemModel, QVBoxLayout, QWidget, QAction,
-    QFileDialog, QMessageBox, QInputDialog, QLineEdit, QDialog, QLabel, QPushButton,
-    QHBoxLayout, QTextEdit, QCompleter, QListView, QMenu, QTextBrowser, QListWidget,
-    QListWidgetItem, QStatusBar, QToolBar, QShortcut, QFontDialog, QColorDialog,
-    QActionGroup, QCheckBox
-)
+import sys
+from typing import Optional
 
-# ───────────────────────────── 搜尋對話框 ─────────────────────────────
-class SearchDialog(QDialog):
-    def __init__(self, editor):
+from PyQt5.QtCore import (QDir, QFileInfo, QProcess, QSettings, QSize,
+                           QThread, QTimer, Qt, pyqtSignal)
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QPainter,
+                         QSyntaxHighlighter, QTextCharFormat, QTextCursor,
+                         QTextFormat)
+from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QCompleter,
+                              QDialog, QFileDialog, QFileSystemModel,
+                              QFontDialog, QHBoxLayout, QInputDialog, QLabel,
+                              QLineEdit, QListWidget, QListWidgetItem,
+                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                              QPushButton, QSplitter, QStatusBar, QTabWidget,
+                              QTextBrowser, QTextEdit, QToolBar, QTreeView,
+                              QVBoxLayout, QWidget)
+
+# ══════════════════════════════════════════════════════════════════════
+#  型態別名
+# ══════════════════════════════════════════════════════════════════════
+Span  = tuple[int, int, str, bool, bool]   # (start, length, color, bold, italic)
+Spans = list[Span]
+
+# ══════════════════════════════════════════════════════════════════════
+#  搜尋對話框
+# ══════════════════════════════════════════════════════════════════════
+
+class SearchWorker(QThread):
+    """非同步搜尋 Worker，來自 Scarch.py 架構，整合 abort 機制。"""
+    result_found = pyqtSignal(int, int, int, str, str)  # tab_idx, line, col, text, file_name
+    search_done  = pyqtSignal(int)                       # total 結果數
+
+    def __init__(self, editors: dict, pattern: re.Pattern,
+                 tab_names: dict[int, str]) -> None:
         super().__init__()
-        self.editor = editor
-        self.setWindowTitle("搜尋文字")
-        self.setMinimumWidth(480)
-        self._main_window = None  # 快取，避免重複查找
+        self._editors   = editors    # {tab_widget: CodeEditor}
+        self._pattern   = pattern
+        self._tab_names = tab_names  # {tab_index: file_name}
+        self._abort     = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        total = 0
+        for tab_index, (tab, editor) in enumerate(self._editors.items()):
+            block    = editor.document().firstBlock()
+            line_num = 0
+            while block.isValid():
+                if self._abort:
+                    return                          # 不 emit search_done，直接結束
+                text = block.text()
+                for m in self._pattern.finditer(text):
+                    total += 1
+                    self.result_found.emit(
+                        tab_index, line_num + 1, m.start(),
+                        text.strip(), self._tab_names.get(tab_index, '未命名'))
+                block    = block.next()
+                line_num += 1
+        self.search_done.emit(total)
+
+
+class SearchDialog(QDialog):
+    def __init__(self, editor: CodeEditor) -> None:
+        super().__init__()
+        self.editor  = editor
+        self._worker: Optional[SearchWorker] = None
+        self._main_window: Optional[MainWindow] = None
+        self.setWindowTitle("搜尋")
+        self.setMinimumWidth(520)
 
         layout = QVBoxLayout()
 
@@ -34,9 +82,13 @@ class SearchDialog(QDialog):
         self.search_input.setPlaceholderText("輸入關鍵字或正則表達式…")
         self.search_input.returnPressed.connect(self.find_text)
         input_row.addWidget(self.search_input)
-        search_btn = QPushButton("搜尋")
-        search_btn.clicked.connect(self.find_text)
-        input_row.addWidget(search_btn)
+        self._btn_search = QPushButton("搜尋")
+        self._btn_search.clicked.connect(self.find_text)
+        input_row.addWidget(self._btn_search)
+        self._btn_stop = QPushButton("停止")
+        self._btn_stop.clicked.connect(self._stop_search)
+        self._btn_stop.setEnabled(False)
+        input_row.addWidget(self._btn_stop)
         layout.addLayout(input_row)
 
         # 選項列
@@ -50,25 +102,21 @@ class SearchDialog(QDialog):
         option_row.addStretch()
         layout.addLayout(option_row)
 
-        # 錯誤提示（平常隱藏）
         self.error_label = QLabel("")
         self.error_label.setStyleSheet("color: #f48771;")
         self.error_label.hide()
         layout.addWidget(self.error_label)
 
-        # 結果計數
         self.count_label = QLabel("")
         self.count_label.setStyleSheet("color: #858585; font-size: 12px;")
         layout.addWidget(self.count_label)
 
-        # 結果列表
         self.result_list = QListWidget()
         self.result_list.itemClicked.connect(self._on_item_clicked)
         layout.addWidget(self.result_list)
-
         self.setLayout(layout)
 
-    def _get_main_window(self):
+    def _get_main_window(self) -> Optional[MainWindow]:
         if self._main_window:
             return self._main_window
         parent = self.parentWidget() or self.editor.parentWidget()
@@ -76,65 +124,84 @@ class SearchDialog(QDialog):
             self._main_window = parent.parentWidget()
         return self._main_window
 
-    def _build_pattern(self, keyword):
-        """根據選項建立 re pattern，回傳 (pattern, error_msg)。"""
+    def _build_pattern(self, keyword: str) -> tuple[Optional[re.Pattern], Optional[str]]:
         flags = 0 if self.chk_case.isChecked() else re.IGNORECASE
-
         if self.chk_regex.isChecked():
             try:
-                pattern = re.compile(keyword, flags)
+                return re.compile(keyword, flags), None
             except re.error as e:
                 return None, f"Regex 錯誤：{e}"
-        else:
-            escaped = re.escape(keyword)
-            if self.chk_word.isChecked():
-                escaped = rf"\b{escaped}\b"
-            pattern = re.compile(escaped, flags)
+        escaped = re.escape(keyword)
+        if self.chk_word.isChecked():
+            escaped = rf"\b{escaped}\b"    # 注意：單個 \b，Scarch.py 原版是 \\b（bug）
+        return re.compile(escaped, flags), None
 
-        return pattern, None
-
-    def find_text(self):
+    def find_text(self) -> None:
+        # 先 abort 舊的 worker
+        self._stop_search()
         self.result_list.clear()
         self.error_label.hide()
-        self.count_label.setText("")
+        self.count_label.setText("搜尋中…")
 
         keyword = self.search_input.text()
         if not keyword:
+            self.count_label.setText("")
             return
 
         pattern, err = self._build_pattern(keyword)
         if err:
             self.error_label.setText(err)
             self.error_label.show()
+            self.count_label.setText("")
             return
 
         main_window = self._get_main_window()
         if not main_window:
             return
 
-        total = 0
-        for tab_index in range(main_window.tabs.count()):
-            tab = main_window.tabs.widget(tab_index)
+        # 建立 tab_index → file_name 的對照表
+        tab_names: dict[int, str] = {}
+        editors_ordered: dict = {}
+        for i in range(main_window.tabs.count()):
+            tab = main_window.tabs.widget(i)
             editor = main_window.editor_widgets.get(tab)
-            if not editor:
-                continue
-            lines = editor.toPlainText().split('\n')
-            for line_num, line in enumerate(lines, start=1):
-                matches = list(pattern.finditer(line))
-                if not matches:
-                    continue
-                total += len(matches)
-                file_name = QFileInfo(getattr(tab, 'file_path', '未命名')).fileName()
-                # 標示每個符合位置（col）
-                cols = ", ".join(f"欄{m.start()+1}" for m in matches)
-                item_text = f"{file_name}  第 {line_num} 行  [{cols}]：{line.strip()}"
-                item = QListWidgetItem(item_text)
-                item.setData(Qt.UserRole, (tab_index, line_num, matches[0].start()))
-                self.result_list.addItem(item)
+            if editor:
+                tab_names[i] = QFileInfo(getattr(tab, 'file_path', '未命名')).fileName()
+                editors_ordered[tab] = editor
 
+        self._worker = SearchWorker(editors_ordered, pattern, tab_names)
+        self._worker.result_found.connect(self._on_result_found)
+        self._worker.search_done.connect(self._on_search_done)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._btn_search.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._worker.start()
+
+    def _stop_search(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.abort()
+            self._worker.finished.connect(self._worker.deleteLater)
+            self._worker = None
+        self._btn_search.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+
+    def _on_result_found(self, tab_index: int, line_num: int, col: int,
+                         text: str, file_name: str) -> None:
+        cols = f"欄{col+1}"
+        item = QListWidgetItem(f"{file_name}  第 {line_num} 行  [{cols}]：{text}")
+        item.setData(Qt.UserRole, (tab_index, line_num, col))
+        self.result_list.addItem(item)
+        # 即時更新計數，讓使用者邊搜尋邊看到結果
+        self.count_label.setText(f"找到 {self.result_list.count()} 行（搜尋中…）")
+
+    def _on_search_done(self, total: int) -> None:
         self.count_label.setText(f"共找到 {total} 個符合，{self.result_list.count()} 行")
 
-    def _on_item_clicked(self, item):
+    def _on_worker_finished(self) -> None:
+        self._btn_search.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
         main_window = self._get_main_window()
         if not main_window:
             return
@@ -142,7 +209,6 @@ class SearchDialog(QDialog):
         main_window.tabs.setCurrentIndex(tab_index)
         editor = main_window.editor_widgets[main_window.tabs.widget(tab_index)]
 
-        # 移到對應行並高亮該行的符合文字
         cursor = editor.textCursor()
         cursor.movePosition(QTextCursor.Start)
         for _ in range(line_num - 1):
@@ -150,10 +216,9 @@ class SearchDialog(QDialog):
         cursor.movePosition(QTextCursor.StartOfLine)
         cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, col)
 
-        # 選取符合的文字長度
-        keyword = self.search_input.text()
+        keyword    = self.search_input.text()
         pattern, _ = self._build_pattern(keyword)
-        line_text = editor.document().findBlockByLineNumber(line_num - 1).text()
+        line_text  = editor.document().findBlockByLineNumber(line_num - 1).text()
         m = pattern.search(line_text, col)
         if m:
             cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, len(m.group()))
@@ -161,29 +226,31 @@ class SearchDialog(QDialog):
         editor.setTextCursor(cursor)
         editor.setFocus()
 
-# ───────────────────────────── 取代對話框 ─────────────────────────────
+    def closeEvent(self, event) -> None:
+        self._stop_search()
+        super().closeEvent(event)
+
+# ══════════════════════════════════════════════════════════════════════
+#  取代對話框
+# ══════════════════════════════════════════════════════════════════════
 class ReplaceDialog(QDialog):
-    def __init__(self, editor):
+    def __init__(self, editor: CodeEditor) -> None:
         super().__init__()
         self.editor = editor
         self.setWindowTitle("搜尋與取代")
         self.setMinimumWidth(480)
 
         layout = QVBoxLayout()
-
-        # 搜尋輸入
         layout.addWidget(QLabel("搜尋："))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("輸入關鍵字或正則表達式…")
         layout.addWidget(self.search_input)
 
-        # 取代輸入
         layout.addWidget(QLabel("取代為："))
         self.replace_input = QLineEdit()
         self.replace_input.setPlaceholderText("取代內容（Regex 模式可用 \\1 回參）")
         layout.addWidget(self.replace_input)
 
-        # 選項列
         opt_row = QHBoxLayout()
         self.chk_regex = QCheckBox("正則表達式")
         self.chk_case  = QCheckBox("區分大小寫")
@@ -194,27 +261,21 @@ class ReplaceDialog(QDialog):
         opt_row.addStretch()
         layout.addLayout(opt_row)
 
-        # 錯誤 / 結果提示
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: #858585; font-size: 12px;")
         layout.addWidget(self.info_label)
 
-        # 按鈕列
         btn_row = QHBoxLayout()
-        btn_find    = QPushButton("找下一個")
-        btn_replace = QPushButton("取代")
-        btn_all     = QPushButton("全部取代")
-        btn_find.clicked.connect(self.find_next)
-        btn_replace.clicked.connect(self.replace_one)
-        btn_all.clicked.connect(self.replace_all)
-        btn_row.addWidget(btn_find)
-        btn_row.addWidget(btn_replace)
-        btn_row.addWidget(btn_all)
+        for label, slot in [("找下一個", self.find_next),
+                             ("取代",     self.replace_one),
+                             ("全部取代", self.replace_all)]:
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
         layout.addLayout(btn_row)
-
         self.setLayout(layout)
 
-    def _build_pattern(self, keyword):
+    def _build_pattern(self, keyword: str) -> tuple[Optional[re.Pattern], Optional[str]]:
         flags = 0 if self.chk_case.isChecked() else re.IGNORECASE
         if self.chk_regex.isChecked():
             try:
@@ -226,7 +287,7 @@ class ReplaceDialog(QDialog):
             escaped = rf"\b{escaped}\b"
         return re.compile(escaped, flags), None
 
-    def find_next(self):
+    def find_next(self) -> bool:
         keyword = self.search_input.text()
         if not keyword:
             return False
@@ -236,11 +297,8 @@ class ReplaceDialog(QDialog):
             return False
 
         full_text = self.editor.toPlainText()
-        cursor = self.editor.textCursor()
-        start = cursor.selectionEnd()
-        m = pattern.search(full_text, start)
-        if not m:
-            m = pattern.search(full_text)  # 從頭繞回
+        start     = self.editor.textCursor().selectionEnd()
+        m = pattern.search(full_text, start) or pattern.search(full_text)
         if m:
             c = self.editor.textCursor()
             c.setPosition(m.start())
@@ -251,63 +309,61 @@ class ReplaceDialog(QDialog):
         self.info_label.setText("找不到符合內容")
         return False
 
-    def replace_one(self):
+    def replace_one(self) -> None:
         cursor = self.editor.textCursor()
         if not cursor.hasSelection():
             self.find_next()
             return
         keyword = self.search_input.text()
-        replace = self.replace_input.text()
         pattern, err = self._build_pattern(keyword)
         if err:
             self.info_label.setText(err)
             return
-        selected = cursor.selectedText()
-        new_text = pattern.sub(replace, selected, count=1)
-        cursor.insertText(new_text)
+        cursor.insertText(pattern.sub(self.replace_input.text(), cursor.selectedText(), count=1))
         self.find_next()
 
-    def replace_all(self):
+    def replace_all(self) -> None:
         keyword = self.search_input.text()
-        replace = self.replace_input.text()
         if not keyword:
             return
         pattern, err = self._build_pattern(keyword)
         if err:
             self.info_label.setText(err)
             return
-        original = self.editor.toPlainText()
-        new_text, count = pattern.subn(replace, original)
+        new_text, count = pattern.subn(self.replace_input.text(), self.editor.toPlainText())
         if count:
             self.editor.setPlainText(new_text)
             self.info_label.setText(f"已取代 {count} 處")
         else:
             self.info_label.setText("找不到符合內容")
 
-# ───────────────────────────── 終端機 ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  終端機
+# ══════════════════════════════════════════════════════════════════════
 class TerminalWidget(QTextEdit):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 13px;")
+        self.setStyleSheet(
+            "background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 13px;")
         self.process = QProcess()
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.readyReadStandardError.connect(self.read_error)
         self.process.start("bash")
         self.append("$ ")
 
-    def read_output(self):
+    def read_output(self) -> None:
         data = self.process.readAllStandardOutput().data().decode(errors='replace')
         self.insertPlainText(data)
         self.append("$ ")
 
-    def read_error(self):
+    def read_error(self) -> None:
         data = self.process.readAllStandardError().data().decode(errors='replace')
         self.setTextColor(QColor("#f48771"))
         self.insertPlainText(data)
         self.setTextColor(QColor("#d4d4d4"))
         self.append("$ ")
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.End)
@@ -319,23 +375,27 @@ class TerminalWidget(QTextEdit):
         else:
             super().keyPressEvent(event)
 
-# ───────────────────────────── 行號區域 ───────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  行號區域
+# ══════════════════════════════════════════════════════════════════════
 class LineNumberArea(QWidget):
-    def __init__(self, editor):
+    def __init__(self, editor: CodeEditor) -> None:
         super().__init__(editor)
         self.editor = editor
 
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         return QSize(self.editor.lineNumberAreaWidth(), 0)
 
-    def paintEvent(self, event):
+    def paintEvent(self, event) -> None:
         self.editor.lineNumberAreaPaintEvent(event)
 
-# ───────────────────────────── 程式碼編輯器 ───────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  程式碼編輯器
+# ══════════════════════════════════════════════════════════════════════
 class CodeEditor(QPlainTextEdit):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.highlighter = PythonHighlighter(self.document())
+        self.highlighter: BaseHighlighter = PythonHighlighter(self.document())
         self.cursorPositionChanged.connect(self.highlight_current_line)
         self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
         self.updateRequest.connect(self.updateLineNumberArea)
@@ -348,7 +408,7 @@ class CodeEditor(QPlainTextEdit):
             'while', 'for', 'in', 'try', 'except', 'finally', 'with', 'as',
             'pass', 'break', 'continue', 'lambda', 'True', 'False', 'None',
             'and', 'or', 'not', 'is', 'print', 'len', 'range', 'enumerate',
-            'open', 'self', 'super', '__init__'
+            'open', 'self', 'super', '__init__',
         ]
         self.completer = QCompleter(keywords)
         self.completer.setWidget(self)
@@ -356,42 +416,37 @@ class CodeEditor(QPlainTextEdit):
         self.completer.setCaseSensitivity(Qt.CaseInsensitive)
         self.completer.activated.connect(self.insert_completion)
         self.cursorPositionChanged.connect(self.highlight_brackets)
-
-        # 初始 viewport 通知（視窗剛開啟時）
         self.verticalScrollBar().valueChanged.connect(self._notify_viewport)
 
-    def _notify_viewport(self, *_):
-        """把目前可見的行號範圍告訴 highlighter。"""
+    def _notify_viewport(self, *_) -> None:
+        """計算目前可見行號範圍並通知 highlighter。"""
         first = self.firstVisibleBlock()
         if not first.isValid():
             return
         first_line = first.blockNumber()
-
-        # 算出最後一個可見行
         block      = first
         last_line  = first_line
         vp_bottom  = self.viewport().rect().bottom()
         while block.isValid():
-            bounding = self.blockBoundingGeometry(block).translated(self.contentOffset())
-            if bounding.top() > vp_bottom:
+            if self.blockBoundingGeometry(block).translated(self.contentOffset()).top() > vp_bottom:
                 break
             last_line = block.blockNumber()
             block = block.next()
-
         self.highlighter.set_viewport(first_line, last_line)
 
-    def scrollContentsBy(self, dx, dy):
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
         if dy != 0:
             self._notify_viewport()
 
-    def resizeEvent(self, event):
+    def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         cr = self.contentsRect()
-        self.lineNumberArea.setGeometry(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
+        self.lineNumberArea.setGeometry(
+            cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
         self._notify_viewport()
 
-    def insert_completion(self, text):
+    def insert_completion(self, text: str) -> None:
         tc = self.textCursor()
         extra = len(text) - len(self.completer.completionPrefix())
         tc.movePosition(QTextCursor.Left)
@@ -399,27 +454,23 @@ class CodeEditor(QPlainTextEdit):
         tc.insertText(text[-extra:])
         self.setTextCursor(tc)
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event) -> None:
         if self.completer.popup().isVisible():
             if event.key() in (Qt.Key_Enter, Qt.Key_Return, Qt.Key_Tab,
                                Qt.Key_Escape, Qt.Key_Backtab):
                 event.ignore()
                 return
 
-        # Ctrl+/ — 切換行註解
         if event.key() == Qt.Key_Slash and event.modifiers() == Qt.ControlModifier:
             self._toggle_comment()
             return
 
-        # Ctrl+D — 選取下一個相同文字
         if event.key() == Qt.Key_D and event.modifiers() == Qt.ControlModifier:
             self._select_next_occurrence()
             return
 
-        # Tab / Shift+Tab — 整段縮排 / 反縮排
         if event.key() == Qt.Key_Tab:
-            cursor = self.textCursor()
-            if cursor.hasSelection():
+            if self.textCursor().hasSelection():
                 self._indent_selection(dedent=False)
             else:
                 self.insertPlainText("    ")
@@ -429,7 +480,6 @@ class CodeEditor(QPlainTextEdit):
             self._indent_selection(dedent=True)
             return
 
-        # 自動配對括號
         pairs = {'(': ')', '[': ']', '{': '}', '"': '"', "'": "'"}
         if event.text() in pairs:
             super().keyPressEvent(event)
@@ -441,7 +491,6 @@ class CodeEditor(QPlainTextEdit):
 
         super().keyPressEvent(event)
 
-        # 自動完成觸發
         if event.text().isalpha() or event.text() == '_':
             cursor = self.textCursor()
             cursor.select(QTextCursor.WordUnderCursor)
@@ -460,18 +509,15 @@ class CodeEditor(QPlainTextEdit):
         else:
             self.completer.popup().hide()
 
-    # ── 整段縮排 / 反縮排 ──
-    def _indent_selection(self, dedent=False):
+    def _indent_selection(self, dedent: bool = False) -> None:
         cursor = self.textCursor()
-        start = cursor.selectionStart()
-        end   = cursor.selectionEnd()
-
-        cursor.setPosition(start)
+        cursor.setPosition(cursor.selectionStart())
         cursor.movePosition(QTextCursor.StartOfLine)
-        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.setPosition(cursor.anchor() if not cursor.hasSelection()
+                           else self.textCursor().selectionEnd(), QTextCursor.KeepAnchor)
         cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
 
-        lines = cursor.selectedText().split('\u2029')  # Qt 段落分隔符
+        lines     = cursor.selectedText().split('\u2029')
         new_lines = []
         for line in lines:
             if dedent:
@@ -485,53 +531,42 @@ class CodeEditor(QPlainTextEdit):
                 new_lines.append('    ' + line)
         cursor.insertText('\u2029'.join(new_lines))
 
-    # ── 切換行註解 Ctrl+/ ──
-    def _toggle_comment(self):
+    def _toggle_comment(self) -> None:
         cursor = self.textCursor()
-        start = cursor.selectionStart()
-        end   = cursor.selectionEnd()
-
-        cursor.setPosition(start)
+        cursor.setPosition(cursor.selectionStart())
         cursor.movePosition(QTextCursor.StartOfLine)
+        end = self.textCursor().selectionEnd()
         cursor.setPosition(end, QTextCursor.KeepAnchor)
         cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
 
-        lines = cursor.selectedText().split('\u2029')
-        # 如果全部都有 # 就取消，否則加上
+        lines        = cursor.selectedText().split('\u2029')
         all_commented = all(l.lstrip().startswith('#') for l in lines if l.strip())
         new_lines = []
         for line in lines:
             if all_commented:
-                # 移除第一個 # （保留縮排）
                 stripped = line.lstrip()
-                indent = line[:len(line) - len(stripped)]
+                indent   = line[:len(line) - len(stripped)]
                 new_lines.append(indent + stripped[1:].lstrip() if stripped.startswith('#') else line)
             else:
                 new_lines.append('# ' + line)
         cursor.insertText('\u2029'.join(new_lines))
 
-    # ── Ctrl+D 選取下一個相同文字 ──
-    def _select_next_occurrence(self):
+    def _select_next_occurrence(self) -> None:
         cursor = self.textCursor()
         if not cursor.hasSelection():
             cursor.select(QTextCursor.WordUnderCursor)
             self.setTextCursor(cursor)
             return
-
         word = cursor.selectedText()
         if not word:
             return
+        found = self.document().find(word, cursor.selectionEnd())
+        if found.isNull():
+            found = self.document().find(word, 0)
+        if not found.isNull():
+            self.setTextCursor(found)
 
-        doc = self.document()
-        # 從目前選取結尾往後找
-        search_cursor = doc.find(word, cursor.selectionEnd())
-        if search_cursor.isNull():
-            # 繞回從頭找
-            search_cursor = doc.find(word, 0)
-        if not search_cursor.isNull():
-            self.setTextCursor(search_cursor)
-
-    def highlight_brackets(self):
+    def highlight_brackets(self) -> None:
         selections = []
         if not self.isReadOnly():
             sel = QPlainTextEdit.ExtraSelection()
@@ -541,15 +576,15 @@ class CodeEditor(QPlainTextEdit):
             sel.cursor.clearSelection()
             selections.append(sel)
 
-        cursor = self.textCursor()
-        doc = self.document()
-        pos = cursor.position()
-        open_br = "([{"
-        close_br = ")]}"
+        cursor    = self.textCursor()
+        doc       = self.document()
+        pos       = cursor.position()
+        open_br   = "([{"
+        close_br  = ")]}"
         pairs_map = {'(': ')', '[': ']', '{': '}', ')': '(', ']': '[', '}': '{'}
         ch = doc.characterAt(pos)
         if ch not in open_br + close_br:
-            ch = doc.characterAt(pos - 1)
+            ch  = doc.characterAt(pos - 1)
             pos -= 1
         if ch in open_br + close_br:
             match_pos = self._find_matching_bracket(doc, pos, ch, pairs_map)
@@ -567,12 +602,13 @@ class CodeEditor(QPlainTextEdit):
                     selections.append(sel)
         self.setExtraSelections(selections)
 
-    def _find_matching_bracket(self, doc, pos, ch, pairs_map):
-        target = pairs_map.get(ch, '')
+    def _find_matching_bracket(self, doc, pos: int, ch: str,
+                               pairs_map: dict[str, str]) -> int:
+        target    = pairs_map.get(ch, '')
         direction = 1 if ch in "([{" else -1
-        depth = 0
-        i = pos
-        length = doc.characterCount()
+        depth     = 0
+        i         = pos
+        length    = doc.characterCount()
         while 0 <= i < length:
             c = doc.characterAt(i)
             if c == ch:
@@ -584,212 +620,204 @@ class CodeEditor(QPlainTextEdit):
             i += direction
         return -1
 
-    def highlight_current_line(self):
+    def highlight_current_line(self) -> None:
         self.highlight_brackets()
 
-    def lineNumberAreaWidth(self):
+    def lineNumberAreaWidth(self) -> int:
         digits = len(str(max(1, self.blockCount())))
         return 6 + self.fontMetrics().horizontalAdvance('9') * digits
 
-    def updateLineNumberAreaWidth(self, _):
+    def updateLineNumberAreaWidth(self, _) -> None:
         self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
 
-    def updateLineNumberArea(self, rect, dy):
+    def updateLineNumberArea(self, rect, dy: int) -> None:
         if dy:
             self.lineNumberArea.scroll(0, dy)
         else:
             self.lineNumberArea.update(0, rect.y(), self.lineNumberArea.width(), rect.height())
 
-    def lineNumberAreaPaintEvent(self, event):
-        painter = QPainter(self.lineNumberArea)
+    def lineNumberAreaPaintEvent(self, event) -> None:
+        painter      = QPainter(self.lineNumberArea)
         painter.fillRect(event.rect(), QColor("#2d2d2d"))
-        block = self.firstVisibleBlock()
-        blockNumber = block.blockNumber()
-        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
-        bottom = top + int(self.blockBoundingRect(block).height())
+        block        = self.firstVisibleBlock()
+        blockNumber  = block.blockNumber()
+        top          = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom       = top + int(self.blockBoundingRect(block).height())
         current_line = self.textCursor().blockNumber()
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
-                number = str(blockNumber + 1)
                 painter.setPen(QColor("#ffffff") if blockNumber == current_line else QColor("#858585"))
                 painter.drawText(0, top, self.lineNumberArea.width() - 4,
-                                 self.fontMetrics().height(), Qt.AlignRight, number)
-            block = block.next()
-            top = bottom
-            bottom = top + int(self.blockBoundingRect(block).height())
+                                 self.fontMetrics().height(), Qt.AlignRight, str(blockNumber + 1))
+            block       = block.next()
+            top         = bottom
+            bottom      = top + int(self.blockBoundingRect(block).height())
             blockNumber += 1
 
 # ══════════════════════════════════════════════════════════════════════
 #  增量 Viewport 高亮架構
 #
-#  小檔（< SYNC_THRESHOLD 行）
-#    → highlightBlock() 直接同步，零延遲
-#
-#  大檔（≥ SYNC_THRESHOLD 行）
-#    → 只計算 viewport ± VIEWPORT_PADDING 行的範圍
-#    → 結果存進 dict 快取（行號 → spans），已算過的行不重算
-#    → 文字變動時只 invalidate 受影響的行，不清空整個快取
-#    → Worker 帶 abort flag，debounce 150ms 後才啟動，避免連打堆積
+#  小檔（< SYNC_THRESHOLD 行）→ highlightBlock() 直接同步
+#  大檔                       → 只算 viewport ± VIEWPORT_PADDING 行
+#                               結果存進 dict 快取，已算過的行不重算
+#                               Worker 只把「viewport 範圍」的結果回傳，
+#                               不把幾十萬行的 spans 全塞進記憶體
 # ══════════════════════════════════════════════════════════════════════
 SYNC_THRESHOLD   = 500    # 低於此行數直接同步高亮
 VIEWPORT_PADDING = 300    # viewport 上下各多算幾行當緩衝
+CACHE_MAX_LINES  = 5_000  # 快取最多保留幾行，超出時淘汰 viewport 外的舊資料
 
-# ── Rule 描述（純資料，可跨 thread）────────────────────────────────────
 class _Rule:
+    """單條高亮規則（純資料，可跨 thread 傳遞）。"""
     __slots__ = ('pattern', 'color', 'bold', 'italic')
-    def __init__(self, pattern, color, bold=False, italic=False):
+
+    def __init__(self, pattern: re.Pattern, color: str,
+                 bold: bool = False, italic: bool = False) -> None:
         self.pattern = pattern
         self.color   = color
         self.bold    = bold
         self.italic  = italic
 
-# ── 背景 Worker：只算指定行範圍 ────────────────────────────────────────
 class HighlightWorker(QThread):
     """
-    接收 lines（list[str]）和起始行號 line_offset，
-    只對這批行跑 re，產出 {絕對行號: spans} dict。
+    子執行緒：只對 [line_offset, line_offset+len(lines)) 這個視窗跑 re。
 
-    每處理一行前檢查 _abort，被 abort() 後立刻 return 不 emit，
-    避免過期結果覆蓋新的高亮。
+    回傳的 patch dict 只包含這個視窗的結果，不是整份文件，
+    避免 10 MB 大檔把幾十萬行 spans 全部塞進記憶體。
+
+    每行開始前檢查 _abort flag，abort() 後立刻 return 不 emit。
     """
-    results_ready = pyqtSignal(dict, int, int)  # (cache_patch, range_start, range_end)
+    results_ready = pyqtSignal(dict, int, int)   # (patch, range_start, range_end)
 
-    def __init__(self, lines, line_offset, rules, parent=None):
+    def __init__(self, lines: list[str], line_offset: int,
+                 rules: list[_Rule], parent=None) -> None:
         super().__init__(parent)
-        self._lines       = lines        # 本次要算的那些行文字
-        self._line_offset = line_offset  # 這批行在整份文件的起始行號
+        self._lines       = lines
+        self._line_offset = line_offset
         self._rules       = rules
         self._abort       = False
 
-    def abort(self):
+    def abort(self) -> None:
+        """主執行緒呼叫：設旗標，讓 run() 在下一行跳出。"""
         self._abort = True
 
-    def run(self):
-        patch = {}
+    def run(self) -> None:
+        patch: dict[int, Spans] = {}
         for i, line in enumerate(self._lines):
             if self._abort:
-                return                   # 不 emit，結果丟棄
-            spans = []
+                return                      # 不 emit，結果丟棄
+            spans: Spans = []
             for rule in self._rules:
                 for m in rule.pattern.finditer(line):
                     spans.append((m.start(), m.end() - m.start(),
                                   rule.color, rule.bold, rule.italic))
             patch[self._line_offset + i] = spans
-        self.results_ready.emit(
-            patch,
-            self._line_offset,
-            self._line_offset + len(self._lines) - 1
-        )
+        self.results_ready.emit(patch, self._line_offset,
+                                self._line_offset + len(self._lines) - 1)
 
-# ── 基礎高亮器 ─────────────────────────────────────────────────────────
 class BaseHighlighter(QSyntaxHighlighter):
-    def __init__(self, document):
+    def __init__(self, document) -> None:
         super().__init__(document)
-        self._rules: list[_Rule] = []
+        self._rules: list[_Rule]        = []
+        self._cache: dict[int, Spans]   = {}   # 行號 → spans，只存 viewport 附近
+        self._vp_start: int             = 0
+        self._vp_end:   int             = 0
+        self._worker: Optional[HighlightWorker] = None
 
-        # 行快取：{行號(int) -> spans(list)}，只存算過的行
-        self._cache: dict[int, list] = {}
-
-        # 目前 viewport 範圍（行號），由 CodeEditor 呼叫 set_viewport() 更新
-        self._vp_start = 0
-        self._vp_end   = 0
-
-        self._worker: HighlightWorker | None = None
-
-        # Debounce：150ms 靜止才啟動 Worker
         self._debounce = QTimer()
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(150)
         self._debounce.timeout.connect(self._launch_worker)
 
-        # 記錄哪些行被 invalidate（文字改動），Worker 啟動時才真正重算
         self._dirty: set[int] = set()
 
         self._setup_rules()
         document.contentsChanged.connect(self._on_contents_changed)
 
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         pass   # 子類覆寫
 
-    # ── 格式輔助 ──
     @staticmethod
-    def _make_fmt(color, bold=False, italic=False):
+    def _make_fmt(color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
         fmt = QTextCharFormat()
         fmt.setForeground(QColor(color))
         if bold:   fmt.setFontWeight(QFont.Bold)
         if italic: fmt.setFontItalic(True)
         return fmt
 
-    def _kw(self, words, color="#569cd6", bold=True):
+    def _kw(self, words: list[str], color: str = "#569cd6", bold: bool = True) -> None:
         for w in words:
             self._rules.append(_Rule(re.compile(rf"\b{re.escape(w)}\b"), color, bold=bold))
 
-    def _re(self, pattern, color, bold=False, italic=False):
+    def _re(self, pattern: str, color: str,
+            bold: bool = False, italic: bool = False) -> None:
         self._rules.append(_Rule(re.compile(pattern), color, bold=bold, italic=italic))
 
-    # ── Viewport 更新（由 CodeEditor.scrollContentsBy / resizeEvent 呼叫）──
-    def set_viewport(self, first_line: int, last_line: int):
+    def set_viewport(self, first_line: int, last_line: int) -> None:
+        """由 CodeEditor 在 scroll / resize 時呼叫，更新可見範圍。"""
         new_start = max(0, first_line - VIEWPORT_PADDING)
         new_end   = last_line + VIEWPORT_PADDING
-
-        # viewport 沒變就不重啟
         if new_start == self._vp_start and new_end == self._vp_end:
             return
-
         self._vp_start = new_start
         self._vp_end   = new_end
-        self._debounce.start()   # 稍微 debounce，避免快速滾動時狂重啟
+        self._debounce.start()
 
-    # ── 文字變動：invalidate 受影響的行 ──
-    def _on_contents_changed(self):
+    def _on_contents_changed(self) -> None:
         doc = self.document()
         if doc is None or doc.blockCount() < SYNC_THRESHOLD:
             return
-
-        # 找出目前游標所在的行，以及前後各 5 行一起 invalidate
-        # （因為一次改動可能影響字串跨行、縮排等）
         try:
-            from PyQt5.QtWidgets import QApplication
             widget = QApplication.focusWidget()
             if widget and hasattr(widget, 'textCursor'):
                 cur_line = widget.textCursor().blockNumber()
                 for ln in range(max(0, cur_line - 5), cur_line + 6):
                     self._dirty.add(ln)
-                    self._cache.pop(ln, None)   # 立刻從快取移除，確保不顯示舊結果
+                    self._cache.pop(ln, None)
         except Exception:
             pass
-
         self._debounce.start()
 
-    # ── 啟動（或重啟）Worker，只算 viewport 範圍內 dirty 或未快取的行 ──
-    def _launch_worker(self):
+    def _evict_cache(self) -> None:
+        """
+        把快取限制在 CACHE_MAX_LINES 以內。
+        淘汰策略：優先丟掉距離當前 viewport 最遠的行。
+        """
+        if len(self._cache) <= CACHE_MAX_LINES:
+            return
+        vp_mid    = (self._vp_start + self._vp_end) / 2
+        # 按距離 viewport 中心由遠到近排序，丟掉最遠的
+        sorted_keys = sorted(self._cache.keys(), key=lambda ln: -abs(ln - vp_mid))
+        evict_count = len(self._cache) - CACHE_MAX_LINES
+        for key in sorted_keys[:evict_count]:
+            del self._cache[key]
+
+    def _launch_worker(self) -> None:
         doc = self.document()
         if doc is None or doc.blockCount() < SYNC_THRESHOLD:
             return
 
-        # abort 舊 Worker
+        # Abort 舊 Worker
         if self._worker and self._worker.isRunning():
             self._worker.abort()
             self._worker.finished.connect(self._worker.deleteLater)
             self._worker = None
 
-        # 決定本次要算的行：viewport 範圍內，且不在快取裡（或被 dirty 掉）的
-        all_lines = doc.toPlainText().split('\n')
-        total     = len(all_lines)
-        vp_end    = min(self._vp_end, total - 1)
+        all_lines  = doc.toPlainText().split('\n')
+        total      = len(all_lines)
+        vp_end     = min(self._vp_end, total - 1)
 
-        to_compute = [
-            ln for ln in range(self._vp_start, vp_end + 1)
-            if ln not in self._cache          # 未快取
-        ]
+        # 只算 viewport 範圍內還沒快取的行
+        to_compute = [ln for ln in range(self._vp_start, vp_end + 1)
+                      if ln not in self._cache]
         self._dirty.clear()
 
         if not to_compute:
-            return   # 全部都在快取裡，不需要開 thread
+            return
 
-        # 取出連續的 lines 讓 Worker 處理（保留原始行號對應）
-        first = to_compute[0]
-        last  = to_compute[-1]
+        first       = to_compute[0]
+        last        = to_compute[-1]
+        # ★ 只切出需要的那段 lines，不傳整份文件給 Worker
         lines_slice = all_lines[first: last + 1]
 
         worker = HighlightWorker(lines_slice, first, self._rules, self)
@@ -797,11 +825,12 @@ class BaseHighlighter(QSyntaxHighlighter):
         self._worker = worker
         worker.start()
 
-    def _on_results_ready(self, patch: dict, range_start: int, range_end: int):
-        # 把新算好的結果合併進快取
+    def _on_results_ready(self, patch: dict[int, Spans],
+                          range_start: int, range_end: int) -> None:
+        # ★ patch 只含 viewport 範圍的行，不是全份文件
         self._cache.update(patch)
+        self._evict_cache()         # 超出上限就淘汰舊行
 
-        # 只重新 highlight 這次算的那個範圍，不 rehighlight 整份文件
         doc = self.document()
         if doc is None:
             return
@@ -810,28 +839,27 @@ class BaseHighlighter(QSyntaxHighlighter):
             self.rehighlightBlock(block)
             block = block.next()
 
-    # ── Qt 每次渲染一行時呼叫 ──
-    def highlightBlock(self, text):
+    def highlightBlock(self, text: str) -> None:
         block_num  = self.currentBlock().blockNumber()
         line_count = self.document().blockCount()
 
         if line_count >= SYNC_THRESHOLD:
             spans = self._cache.get(block_num)
             if spans is not None:
-                # 快取命中：直接套用，幾乎零開銷
                 for start, length, color, bold, italic in spans:
                     self.setFormat(start, length, self._make_fmt(color, bold, italic))
-            # 快取未命中（viewport 外或尚未算到）：留白，等 Worker 算完再補
+            # 快取未命中：留白，等 Worker 補
         else:
-            # 小檔：同步直接跑 re
             for rule in self._rules:
                 for m in rule.pattern.finditer(text):
                     self.setFormat(m.start(), m.end() - m.start(),
                                    self._make_fmt(rule.color, rule.bold, rule.italic))
 
-# ───────────────────────────── Python ────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  各語言高亮器（只需覆寫 _setup_rules，其餘繼承 BaseHighlighter）
+# ══════════════════════════════════════════════════════════════════════
 class PythonHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['def','class','if','elif','else','try','except','finally',
                   'while','for','in','import','from','as','return','with','pass',
                   'break','continue','and','or','not','is','lambda',
@@ -841,19 +869,18 @@ class PythonHighlighter(BaseHighlighter):
                   'list','dict','set','tuple','int','str','float','bool',
                   'super','self','zip','map','filter','sorted','reversed',
                   'min','max','sum','abs','round','repr','id','hash',
-                  'getattr','setattr','hasattr','callable','staticmethod',
-                  'classmethod','property'], color="#dcdcaa", bold=False)
-        self._re("@\\w+", "#c586c0")                             # 裝飾器
-        self._re("\\b[0-9]+\\.?[0-9]*([eE][+-]?[0-9]+)?\\b", "#b5cea8")  # 數字
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")      # 雙引號字串
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")      # 單引號字串
-        self._re("#.*", "#6a9955", italic=True)                   # 註解
-        self._re("\\bdef\\s+\\w+", "#dcdcaa")                    # 函式名
-        self._re("\\bclass\\s+\\w+", "#4ec9b0")                  # 類別名
+                  'getattr','setattr','hasattr','callable',
+                  'staticmethod','classmethod','property'], color="#dcdcaa", bold=False)
+        self._re(r"@\w+",                            "#c586c0")
+        self._re(r"\b[0-9]+\.?[0-9]*([eE][+-]?[0-9]+)?\b", "#b5cea8")
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',          "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",          "#ce9178")
+        self._re(r"#.*",                              "#6a9955", italic=True)
+        self._re(r"\bdef\s+\w+",                     "#dcdcaa")
+        self._re(r"\bclass\s+\w+",                   "#4ec9b0")
 
-# ───────────────────────────── JavaScript / TypeScript ───────────────
 class JSHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['var','let','const','function','return','if','else','for',
                   'while','do','switch','case','break','continue','class',
                   'import','export','from','new','delete','typeof','instanceof',
@@ -861,81 +888,69 @@ class JSHighlighter(BaseHighlighter):
                   'try','catch','finally','throw','in','of','void',
                   'true','false','null','undefined','NaN','Infinity',
                   'async','await','yield','static','get','set',
-                  # TypeScript 額外
                   'type','namespace','declare','abstract','readonly',
                   'public','private','protected','as','keyof','infer'])
         self._kw(['console','Math','Object','Array','String','Number','Boolean',
                   'Promise','fetch','setTimeout','setInterval','Map','Set',
                   'JSON','Date','Error','RegExp'], color="#dcdcaa", bold=False)
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re("`[^`]*`", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*.*\\*/", "#6a9955", italic=True)
-        self._re("\\b\\w+(?=\\s*\\()", "#dcdcaa")   # 函式呼叫
-        self._re(":[\\s]*[A-Z]\\w*", "#4ec9b0")     # 型別標注（TS）
+        self._re(r'"[^"]*"',                    "#ce9178")
+        self._re(r"'[^']*'",                    "#ce9178")
+        self._re(r"`[^`]*`",                    "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",       "#b5cea8")
+        self._re(r"//.*",                       "#6a9955", italic=True)
+        self._re(r"/\*.*?\*/",                  "#6a9955", italic=True)
+        self._re(r"\b\w+(?=\s*\()",            "#dcdcaa")
+        self._re(r":[\s]*[A-Z]\w*",            "#4ec9b0")
 
-# ───────────────────────────── HTML / XML ────────────────────────────
 class HTMLHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re("<!--[^>]*-->", "#6a9955", italic=True)   # 註解（先處理）
-        self._re("</?[\\w:-]+", "#4ec9b0")                  # 標籤名
-        self._re(">", "#4ec9b0")
-        self._re("\\b[\\w:-]+(?=\\s*=)", "#9cdcfe")         # 屬性名
-        self._re('"[^"]*"', "#ce9178")                      # 屬性值
-        self._re("'[^']*'", "#ce9178")
-        self._re("&[a-zA-Z0-9#]+;", "#f48771")              # HTML 實體
-        self._re("<!DOCTYPE[^>]*>", "#808080")               # DOCTYPE
+    def _setup_rules(self) -> None:
+        self._re(r"<!--[^>]*-->",              "#6a9955", italic=True)
+        self._re(r"</?[\w:-]+",               "#4ec9b0")
+        self._re(r">",                          "#4ec9b0")
+        self._re(r"\b[\w:-]+(?=\s*=)",        "#9cdcfe")
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r"&[a-zA-Z0-9#]+;",          "#f48771")
+        self._re(r"<!DOCTYPE[^>]*>",           "#808080")
 
-# ───────────────────────────── CSS / SCSS / Less ──────────────────────
 class CSSHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)  # 區塊註解
-        self._re("//.*", "#6a9955", italic=True)             # 行內（SCSS/Less）
-        self._re("[.#][\\w-]+", "#d7ba7d")                   # class / id 選擇器
-        self._re("@[\\w-]+", "#c586c0")                      # at-rules / 變數
-        self._re("\\$[\\w-]+", "#9cdcfe")                    # SCSS 變數
-        self._re("--[\\w-]+", "#9cdcfe")                     # CSS 自訂變數
-        self._re("\\b[a-z-]+(?=\\s*:)", "#9cdcfe")           # 屬性名
-        self._re("#[0-9a-fA-F]{3,8}\\b", "#ce9178")          # 顏色值
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*(px|em|rem|vh|vw|%|pt|s|ms)?\\b", "#b5cea8")
-        self._kw(['important', 'inherit', 'initial', 'unset', 'none',
-                  'auto', 'normal', 'bold', 'italic', 'flex', 'grid',
-                  'block', 'inline', 'absolute', 'relative', 'fixed',
-                  'sticky', 'center', 'left', 'right', 'top', 'bottom'],
-                 color="#569cd6", bold=False)
+    def _setup_rules(self) -> None:
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"[.#][\w-]+",               "#d7ba7d")
+        self._re(r"@[\w-]+",                   "#c586c0")
+        self._re(r"\$[\w-]+",                  "#9cdcfe")
+        self._re(r"--[\w-]+",                  "#9cdcfe")
+        self._re(r"\b[a-z-]+(?=\s*:)",        "#9cdcfe")
+        self._re(r"#[0-9a-fA-F]{3,8}\b",      "#ce9178")
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*(px|em|rem|vh|vw|%|pt|s|ms)?\b", "#b5cea8")
 
-# ───────────────────────────── C / C++ ───────────────────────────────
 class CHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['auto','break','case','char','const','continue','default',
                   'do','double','else','enum','extern','float','for','goto',
                   'if','inline','int','long','register','restrict','return',
                   'short','signed','sizeof','static','struct','switch',
                   'typedef','union','unsigned','void','volatile','while',
-                  # C++ 額外
-                  'bool','class','delete','explicit','export','false',
-                  'friend','mutable','namespace','new','nullptr','operator',
-                  'private','protected','public','template','this','throw',
-                  'true','try','catch','typeid','typename','using','virtual',
-                  'override','final','constexpr','decltype','noexcept',
-                  'static_assert','thread_local','alignas','alignof'])
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*([uUlLfF]*)\\b", "#b5cea8")
-        self._re("0x[0-9a-fA-F]+", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("#\\s*(include|define|ifdef|ifndef|endif|pragma|undef|if|elif|else|error)", "#c586c0")
-        self._re("<[\\w./]+>", "#ce9178")                    # #include <...>
-        self._re("\\b[A-Z][A-Z0-9_]+\\b", "#b5cea8")        # 全大寫常數
+                  'bool','class','delete','explicit','false','friend','mutable',
+                  'namespace','new','nullptr','operator','private','protected',
+                  'public','template','this','throw','true','try','catch',
+                  'typeid','typename','using','virtual','override','final',
+                  'constexpr','decltype','noexcept','static_assert'])
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*[uUlLfF]*\b", "#b5cea8")
+        self._re(r"0x[0-9a-fA-F]+",           "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"#\s*(include|define|ifdef|ifndef|endif|pragma|undef|if|elif|else|error)", "#c586c0")
+        self._re(r"<[\w./]+>",                 "#ce9178")
+        self._re(r"\b[A-Z][A-Z0-9_]+\b",      "#b5cea8")
 
-# ───────────────────────────── Java ──────────────────────────────────
 class JavaHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['abstract','assert','boolean','break','byte','case','catch',
                   'char','class','const','continue','default','do','double',
                   'else','enum','extends','final','finally','float','for',
@@ -948,16 +963,15 @@ class JavaHighlighter(BaseHighlighter):
         self._kw(['System','String','Integer','Double','Boolean','List','Map',
                   'Set','ArrayList','HashMap','Optional','Stream','Object',
                   'Math','Arrays','Collections'], color="#4ec9b0", bold=False)
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*[lLfFdD]?\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("@\\w+", "#c586c0")                         # 注解 annotation
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*[lLfFdD]?\b", "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"@\w+",                      "#c586c0")
 
-# ───────────────────────────── C# ────────────────────────────────────
 class CSharpHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['abstract','as','base','bool','break','byte','case','catch',
                   'char','checked','class','const','continue','decimal','default',
                   'delegate','do','double','else','enum','event','explicit',
@@ -971,83 +985,73 @@ class CSharpHighlighter(BaseHighlighter):
                   'ushort','using','virtual','void','volatile','while',
                   'async','await','var','dynamic','record','init','with',
                   'global','file','required','scoped'])
-        self._re('@?"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*[uUlLfFdDmM]?\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("///.*", "#6a9955", italic=True)            # XML doc comment
-        self._re("\\[\\w+[^\\]]*\\]", "#c586c0")             # Attribute
+        self._re(r'@?"[^"\\]*(\\.[^"\\]*)*"', "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*[uUlLfFdDmM]?\b", "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"///.*",                     "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"\[\w+[^\]]*\]",            "#c586c0")
 
-# ───────────────────────────── Go ────────────────────────────────────
 class GoHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['break','case','chan','const','continue','default','defer',
                   'else','fallthrough','for','func','go','goto','if','import',
                   'interface','map','package','range','return','select','struct',
-                  'switch','type','var',
-                  'true','false','nil','iota'])
+                  'switch','type','var','true','false','nil','iota'])
         self._kw(['append','cap','close','complex','copy','delete','imag',
-                  'len','make','new','panic','print','println','real',
-                  'recover','error','string','int','int8','int16','int32',
-                  'int64','uint','uint8','uint16','uint32','uint64','uintptr',
-                  'float32','float64','complex64','complex128','byte','rune',
-                  'bool'], color="#4ec9b0", bold=False)
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("`[^`]*`", "#ce9178")                       # raw string
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+                  'len','make','new','panic','print','println','real','recover',
+                  'error','string','int','int8','int16','int32','int64',
+                  'uint','uint8','uint16','uint32','uint64','uintptr',
+                  'float32','float64','complex64','complex128','byte','rune','bool'],
+                 color="#4ec9b0", bold=False)
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"`[^`]*`",                   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
 
-# ───────────────────────────── Rust ──────────────────────────────────
 class RustHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['as','async','await','break','const','continue','crate',
                   'dyn','else','enum','extern','false','fn','for','if',
                   'impl','in','let','loop','match','mod','move','mut',
                   'pub','ref','return','self','Self','static','struct',
                   'super','trait','true','type','union','unsafe','use',
-                  'where','while','abstract','become','box','do','final',
-                  'macro','override','priv','try','typeof','unsized','virtual','yield'])
+                  'where','while'])
         self._kw(['i8','i16','i32','i64','i128','isize',
                   'u8','u16','u32','u64','u128','usize',
                   'f32','f64','bool','char','str','String','Vec',
                   'Option','Result','Box','Rc','Arc','HashMap','HashSet',
                   'println','print','eprintln','panic','assert','assert_eq',
-                  'todo','unimplemented','unreachable'],
-                 color="#4ec9b0", bold=False)
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("b\"[^\"]*\"", "#ce9178")                   # byte string
-        self._re("\\b[0-9]+\\.?[0-9]*(_[a-z0-9]+)?\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("#!?\\[[^\\]]*\\]", "#c586c0")              # Attribute
-        self._re("'[a-zA-Z_]\\w*", "#569cd6")               # lifetime
+                  'todo','unimplemented','unreachable'], color="#4ec9b0", bold=False)
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"b\"[^\"]*\"",               "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*(_[a-z0-9]+)?\b", "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"#!?\[[^\]]*\]",            "#c586c0")
+        self._re(r"'[a-zA-Z_]\w*",            "#569cd6")
 
-# ───────────────────────────── Ruby ──────────────────────────────────
 class RubyHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['BEGIN','END','alias','and','begin','break','case','class',
                   'def','defined?','do','else','elsif','end','ensure',
                   'false','for','if','in','module','next','nil','not',
                   'or','redo','rescue','retry','return','self','super',
-                  'then','true','undef','unless','until','when','while','yield',
-                  '__FILE__','__LINE__','__method__','__dir__'])
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("%[qQwWiI]?[{(\\[|!][^})|!]*[})|!]", "#ce9178")  # %q{} 字串
-        self._re(":[a-zA-Z_]\\w*", "#569cd6")               # symbol
-        self._re("@{1,2}[a-zA-Z_]\\w*", "#9cdcfe")          # @var / @@var
-        self._re("\\$[a-zA-Z_]\\w*", "#c586c0")              # $global
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("#.*", "#6a9955", italic=True)
-        self._re("=begin.*=end", "#6a9955", italic=True)
+                  'then','true','undef','unless','until','when','while','yield'])
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r":[a-zA-Z_]\w*",            "#569cd6")
+        self._re(r"@{1,2}[a-zA-Z_]\w*",      "#9cdcfe")
+        self._re(r"\$[a-zA-Z_]\w*",           "#c586c0")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"#.*",                       "#6a9955", italic=True)
 
-# ───────────────────────────── PHP ───────────────────────────────────
 class PHPHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['abstract','and','array','as','break','callable','case',
                   'catch','class','clone','const','continue','declare',
                   'default','die','do','echo','else','elseif','empty',
@@ -1060,109 +1064,95 @@ class PHPHighlighter(BaseHighlighter):
                   'readonly','require','require_once','return','static',
                   'switch','throw','trait','try','true','false','unset',
                   'use','var','while','xor','yield'])
-        self._re("\\$[a-zA-Z_]\\w*", "#9cdcfe")             # 變數
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("<<<['\"]?\\w+['\"]?", "#ce9178")           # heredoc
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("#.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("<\\?php|\\?>", "#c586c0")                  # PHP 標籤
+        self._re(r"\$[a-zA-Z_]\w*",           "#9cdcfe")
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"#.*",                       "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"<\?php|\?>",               "#c586c0")
 
-# ───────────────────────────── Shell / Bash ───────────────────────────
 class ShellHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['if','then','else','elif','fi','for','while','do','done',
-                  'case','esac','function','return','in','until',
-                  'break','continue','exit','local','export','source',
-                  'true','false','null'])
+                  'case','esac','function','return','in','until','break',
+                  'continue','exit','local','export','source','true','false'])
         self._kw(['echo','printf','read','cd','ls','pwd','mkdir','rm','cp',
                   'mv','cat','grep','sed','awk','find','sort','uniq','wc',
                   'chmod','chown','sudo','apt','yum','pip','python3',
-                  'git','curl','wget','tar','zip','unzip'],
-                 color="#dcdcaa", bold=False)
-        self._re("\\$[{(]?[a-zA-Z_][\\w]*[})]?", "#9cdcfe") # 變數
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re("`[^`]*`", "#c586c0")                      # 命令替換
-        self._re("#.*", "#6a9955", italic=True)
-        self._re("\\b[0-9]+\\b", "#b5cea8")
-        self._re("&&|\\|\\||>>?|<<", "#c586c0")             # 運算子
+                  'git','curl','wget','tar','zip','unzip'], color="#dcdcaa", bold=False)
+        self._re(r"\$[{(]?[a-zA-Z_][\w]*[})]?", "#9cdcfe")
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r"`[^`]*`",                   "#c586c0")
+        self._re(r"#.*",                       "#6a9955", italic=True)
+        self._re(r"\b[0-9]+\b",               "#b5cea8")
+        self._re(r"&&|\|\||>>?|<<",           "#c586c0")
 
-# ───────────────────────────── SQL ───────────────────────────────────
 class SQLHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._kw(['SELECT','FROM','WHERE','INSERT','INTO','VALUES','UPDATE',
-                  'SET','DELETE','CREATE','TABLE','DROP','ALTER','ADD',
-                  'COLUMN','INDEX','VIEW','DATABASE','SCHEMA','GRANT',
-                  'REVOKE','COMMIT','ROLLBACK','BEGIN','TRANSACTION',
-                  'JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
-                  'ON','AS','AND','OR','NOT','IN','IS','NULL','LIKE',
-                  'BETWEEN','EXISTS','UNION','ALL','DISTINCT','GROUP',
-                  'BY','ORDER','HAVING','LIMIT','OFFSET','ASC','DESC',
-                  'PRIMARY','KEY','FOREIGN','REFERENCES','UNIQUE',
-                  'DEFAULT','CHECK','CONSTRAINT','RETURNING','WITH',
-                  # 小寫也支援
-                  'select','from','where','insert','into','values','update',
-                  'set','delete','create','table','drop','alter','join',
-                  'left','right','inner','outer','on','as','and','or','not',
-                  'in','is','null','like','between','exists','union',
-                  'group','by','order','having','limit','offset'])
+    def _setup_rules(self) -> None:
+        kws = ['SELECT','FROM','WHERE','INSERT','INTO','VALUES','UPDATE',
+               'SET','DELETE','CREATE','TABLE','DROP','ALTER','ADD',
+               'COLUMN','INDEX','VIEW','DATABASE','SCHEMA','GRANT',
+               'REVOKE','COMMIT','ROLLBACK','BEGIN','TRANSACTION',
+               'JOIN','LEFT','RIGHT','INNER','OUTER','FULL','CROSS',
+               'ON','AS','AND','OR','NOT','IN','IS','NULL','LIKE',
+               'BETWEEN','EXISTS','UNION','ALL','DISTINCT','GROUP',
+               'BY','ORDER','HAVING','LIMIT','OFFSET','ASC','DESC',
+               'PRIMARY','KEY','FOREIGN','REFERENCES','UNIQUE',
+               'DEFAULT','CHECK','CONSTRAINT','RETURNING','WITH']
+        self._kw(kws + [k.lower() for k in kws])
         self._kw(['COUNT','SUM','AVG','MIN','MAX','COALESCE','NULLIF',
                   'CAST','CONVERT','CONCAT','LENGTH','SUBSTR','UPPER',
                   'LOWER','TRIM','NOW','DATE','YEAR','MONTH','DAY',
                   'count','sum','avg','min','max','coalesce'],
                  color="#dcdcaa", bold=False)
-        self._re("'[^']*'", "#ce9178")
-        self._re('"[^"]*"', "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("--.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"--.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
 
-# ───────────────────────────── JSON ──────────────────────────────────
 class JSONHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"\\s*:', "#9cdcfe")  # key
-        self._re(':\\s*"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")  # string value
-        self._re("\\b(true|false|null)\\b", "#569cd6")
-        self._re(":\\s*-?[0-9]+\\.?[0-9]*([eE][+-]?[0-9]+)?", "#b5cea8")
+    def _setup_rules(self) -> None:
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"\s*:', "#9cdcfe")
+        self._re(r':\s*"[^"\\]*(\\.[^"\\]*)*"', "#ce9178")
+        self._re(r"\b(true|false|null)\b",       "#569cd6")
+        self._re(r":\s*-?[0-9]+\.?[0-9]*([eE][+-]?[0-9]+)?", "#b5cea8")
 
-# ───────────────────────────── YAML ──────────────────────────────────
 class YAMLHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re("^---", "#c586c0")                          # document start
-        self._re("^\\s*[\\w-]+\\s*:", "#9cdcfe")            # key
-        self._re(":\\s*.+", "#ce9178")                       # value
-        self._re("^\\s*- ", "#569cd6")                       # list item
-        self._re("&\\w+|\\*\\w+", "#4ec9b0")                # anchor / alias
-        self._re("!\\w+", "#c586c0")                         # tag
-        self._re("#.*", "#6a9955", italic=True)
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re("\\b(true|false|null|yes|no|on|off)\\b", "#569cd6")
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
+    def _setup_rules(self) -> None:
+        self._re(r"^---",                      "#c586c0")
+        self._re(r"^\s*[\w-]+\s*:",            "#9cdcfe")
+        self._re(r":\s*.+",                    "#ce9178")
+        self._re(r"^\s*- ",                    "#569cd6")
+        self._re(r"&\w+|\*\w+",               "#4ec9b0")
+        self._re(r"!\w+",                      "#c586c0")
+        self._re(r"#.*",                       "#6a9955", italic=True)
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r"\b(true|false|null|yes|no|on|off)\b", "#569cd6")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
 
-# ───────────────────────────── Markdown ──────────────────────────────
 class MarkdownHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re("^#{1,6}\\s.*", "#569cd6", bold=True)       # 標題
-        self._re("\\*\\*[^*]+\\*\\*", "#dcdcaa", bold=True)  # **粗體**
-        self._re("\\*[^*]+\\*", "#ce9178", italic=True)       # *斜體*
-        self._re("__[^_]+__", "#dcdcaa", bold=True)
-        self._re("_[^_]+_", "#ce9178", italic=True)
-        self._re("`[^`]+`", "#4ec9b0")                        # `行內程式碼`
-        self._re("^```.*", "#c586c0")                          # 程式碼區塊標記
-        self._re("^>.*", "#6a9955", italic=True)              # 引用
-        self._re("^\\s*[-*+]\\s", "#569cd6")                  # 列表
-        self._re("^\\s*[0-9]+\\.\\s", "#569cd6")             # 有序列表
-        self._re("\\[([^\\]]+)\\]\\([^)]+\\)", "#4ec9b0")    # 連結
-        self._re("!\\[([^\\]]+)\\]\\([^)]+\\)", "#c586c0")   # 圖片
-        self._re("^---+$", "#808080")                          # 分隔線
+    def _setup_rules(self) -> None:
+        self._re(r"^#{1,6}\s.*",              "#569cd6", bold=True)
+        self._re(r"\*\*[^*]+\*\*",            "#dcdcaa", bold=True)
+        self._re(r"\*[^*]+\*",                "#ce9178", italic=True)
+        self._re(r"__[^_]+__",                "#dcdcaa", bold=True)
+        self._re(r"_[^_]+_",                  "#ce9178", italic=True)
+        self._re(r"`[^`]+`",                   "#4ec9b0")
+        self._re(r"^```.*",                    "#c586c0")
+        self._re(r"^>.*",                      "#6a9955", italic=True)
+        self._re(r"^\s*[-*+]\s",              "#569cd6")
+        self._re(r"^\s*[0-9]+\.\s",           "#569cd6")
+        self._re(r"\[([^\]]+)\]\([^)]+\)",    "#4ec9b0")
+        self._re(r"!\[([^\]]+)\]\([^)]+\)",   "#c586c0")
+        self._re(r"^---+$",                    "#808080")
 
-# ───────────────────────────── Kotlin ────────────────────────────────
 class KotlinHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['abstract','actual','annotation','as','break','by','catch',
                   'class','companion','const','constructor','continue',
                   'crossinline','data','delegate','do','dynamic','else',
@@ -1175,17 +1165,16 @@ class KotlinHighlighter(BaseHighlighter):
                   'return','sealed','set','setparam','super','suspend',
                   'tailrec','this','throw','true','try','typealias',
                   'typeof','val','value','var','vararg','when','where','while'])
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re('"""[^"]*"""', "#ce9178")                   # triple-quoted
-        self._re("'[^'\\\\]*(\\\\.[^'\\\\]*)*'", "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*[LFf]?\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("@\\w+", "#c586c0")
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r'"""[^"]*"""',               "#ce9178")
+        self._re(r"'[^'\\]*(\\.[^'\\]*)*'",   "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*[LFf]?\b", "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"@\w+",                      "#c586c0")
 
-# ───────────────────────────── Swift ─────────────────────────────────
 class SwiftHighlighter(BaseHighlighter):
-    def _setup_rules(self):
+    def _setup_rules(self) -> None:
         self._kw(['associatedtype','class','deinit','enum','extension',
                   'fileprivate','func','import','init','inout','internal',
                   'let','open','operator','precedencegroup','private',
@@ -1194,112 +1183,85 @@ class SwiftHighlighter(BaseHighlighter):
                   'continue','default','defer','do','else','fallthrough',
                   'for','guard','if','in','repeat','return','throw',
                   'switch','where','while','Any','as','false','is',
-                  'nil','rethrows','self','Self','super','throw','throws',
-                  'true','try','async','await','actor','nonisolated',
-                  'some','any','consuming','borrowing'])
-        self._re('"[^"\\\\]*(\\\\.[^"\\\\]*)*"', "#ce9178")
-        self._re('"""[^"]*"""', "#ce9178")
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("//.*", "#6a9955", italic=True)
-        self._re("/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/", "#6a9955", italic=True)
-        self._re("@\\w+", "#c586c0")                         # property wrapper
+                  'nil','self','Self','super','throw','throws','true','try',
+                  'async','await','actor','nonisolated','some','any'])
+        self._re(r'"[^"\\]*(\\.[^"\\]*)*"',   "#ce9178")
+        self._re(r'"""[^"]*"""',               "#ce9178")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"//.*",                      "#6a9955", italic=True)
+        self._re(r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/", "#6a9955", italic=True)
+        self._re(r"@\w+",                      "#c586c0")
 
-# ───────────────────────────── Dockerfile ────────────────────────────
 class DockerHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._kw(['FROM','RUN','CMD','LABEL','EXPOSE','ENV','ADD','COPY',
-                  'ENTRYPOINT','VOLUME','USER','WORKDIR','ARG','ONBUILD',
-                  'STOPSIGNAL','HEALTHCHECK','SHELL',
-                  'from','run','cmd','label','expose','env','add','copy',
-                  'entrypoint','volume','user','workdir','arg'])
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re("#.*", "#6a9955", italic=True)
-        self._re("\\$[{]?[a-zA-Z_]\\w*[}]?", "#9cdcfe")
+    def _setup_rules(self) -> None:
+        kws = ['FROM','RUN','CMD','LABEL','EXPOSE','ENV','ADD','COPY',
+               'ENTRYPOINT','VOLUME','USER','WORKDIR','ARG','ONBUILD',
+               'STOPSIGNAL','HEALTHCHECK','SHELL']
+        self._kw(kws + [k.lower() for k in kws])
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r"#.*",                       "#6a9955", italic=True)
+        self._re(r"\$[{]?[a-zA-Z_]\w*[}]?",   "#9cdcfe")
 
-# ───────────────────────────── TOML ──────────────────────────────────
 class TOMLHighlighter(BaseHighlighter):
-    def _setup_rules(self):
-        self._re("^\\[+[^\\]]+\\]+", "#569cd6", bold=True)  # [section]
-        self._re("^\\s*[\\w.-]+\\s*=", "#9cdcfe")           # key
-        self._re('"[^"]*"', "#ce9178")
-        self._re("'[^']*'", "#ce9178")
-        self._re('"""[^"]*"""', "#ce9178")
-        self._re("\\b(true|false)\\b", "#569cd6")
-        self._re("\\b[0-9]{4}-[0-9]{2}-[0-9]{2}", "#4ec9b0") # date
-        self._re("\\b[0-9]+\\.?[0-9]*\\b", "#b5cea8")
-        self._re("#.*", "#6a9955", italic=True)
+    def _setup_rules(self) -> None:
+        self._re(r"^\[+[^\]]+\]+",            "#569cd6", bold=True)
+        self._re(r"^\s*[\w.-]+\s*=",          "#9cdcfe")
+        self._re(r'"[^"]*"',                   "#ce9178")
+        self._re(r"'[^']*'",                   "#ce9178")
+        self._re(r'"""[^"]*"""',               "#ce9178")
+        self._re(r"\b(true|false)\b",          "#569cd6")
+        self._re(r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}", "#4ec9b0")
+        self._re(r"\b[0-9]+\.?[0-9]*\b",      "#b5cea8")
+        self._re(r"#.*",                       "#6a9955", italic=True)
 
-# ══════════════════════════════════════════════════════════════════════
-#  根據副檔名選擇高亮器
-# ══════════════════════════════════════════════════════════════════════
-def get_highlighter_for_file(path, document):
-    ext = QFileInfo(path).suffix().lower()
+# ── 副檔名 → 高亮器 對照表 ────────────────────────────────────────────
+def get_highlighter_for_file(path: str, document) -> BaseHighlighter:
+    ext  = QFileInfo(path).suffix().lower()
     name = QFileInfo(path).fileName().lower()
 
-    MAP = {
-        # Python
-        ('py', 'pyw', 'pyi'): PythonHighlighter,
-        # JavaScript / TypeScript
-        ('js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx'): JSHighlighter,
-        # HTML / XML
-        ('html', 'htm', 'xml', 'xhtml', 'svg'): HTMLHighlighter,
-        # CSS / SCSS / Less
-        ('css', 'scss', 'sass', 'less'): CSSHighlighter,
-        # C / C++
-        ('c', 'h', 'cpp', 'cxx', 'cc', 'hpp', 'hxx'): CHighlighter,
-        # Java
-        ('java',): JavaHighlighter,
-        # C#
-        ('cs',): CSharpHighlighter,
-        # Go
-        ('go',): GoHighlighter,
-        # Rust
-        ('rs',): RustHighlighter,
-        # Ruby
-        ('rb', 'rake', 'gemspec'): RubyHighlighter,
-        # PHP
-        ('php', 'php3', 'php4', 'php5', 'phtml'): PHPHighlighter,
-        # Shell
-        ('sh', 'bash', 'zsh', 'fish', 'ksh'): ShellHighlighter,
-        # SQL
-        ('sql',): SQLHighlighter,
-        # JSON
-        ('json', 'jsonc'): JSONHighlighter,
-        # YAML
-        ('yaml', 'yml'): YAMLHighlighter,
-        # Markdown
-        ('md', 'markdown', 'mdx'): MarkdownHighlighter,
-        # Kotlin
-        ('kt', 'kts'): KotlinHighlighter,
-        # Swift
-        ('swift',): SwiftHighlighter,
-        # Dockerfile
-        ('dockerfile',): DockerHighlighter,
-        # TOML
-        ('toml',): TOMLHighlighter,
-    }
-
-    # 無副檔名特殊檔名（如 Dockerfile、Makefile）
-    NAMEMAP = {
+    NAME_MAP: dict[str, type[BaseHighlighter]] = {
         'dockerfile': DockerHighlighter,
-        'makefile': ShellHighlighter,
-        '.bashrc': ShellHighlighter,
-        '.zshrc': ShellHighlighter,
+        'makefile':   ShellHighlighter,
+        '.bashrc':    ShellHighlighter,
+        '.zshrc':     ShellHighlighter,
         '.gitignore': ShellHighlighter,
     }
-    if name in NAMEMAP:
-        return NAMEMAP[name](document)
+    if name in NAME_MAP:
+        return NAME_MAP[name](document)
 
-    for exts, cls in MAP.items():
+    EXT_MAP: dict[frozenset[str], type[BaseHighlighter]] = {
+        frozenset(['py','pyw','pyi']):                    PythonHighlighter,
+        frozenset(['js','jsx','mjs','cjs','ts','tsx']):   JSHighlighter,
+        frozenset(['html','htm','xml','xhtml','svg']):    HTMLHighlighter,
+        frozenset(['css','scss','sass','less']):          CSSHighlighter,
+        frozenset(['c','h','cpp','cxx','cc','hpp','hxx']): CHighlighter,
+        frozenset(['java']):                              JavaHighlighter,
+        frozenset(['cs']):                                CSharpHighlighter,
+        frozenset(['go']):                                GoHighlighter,
+        frozenset(['rs']):                                RustHighlighter,
+        frozenset(['rb','rake','gemspec']):               RubyHighlighter,
+        frozenset(['php','php3','php4','php5','phtml']): PHPHighlighter,
+        frozenset(['sh','bash','zsh','fish','ksh']):      ShellHighlighter,
+        frozenset(['sql']):                               SQLHighlighter,
+        frozenset(['json','jsonc']):                      JSONHighlighter,
+        frozenset(['yaml','yml']):                        YAMLHighlighter,
+        frozenset(['md','markdown','mdx']):               MarkdownHighlighter,
+        frozenset(['kt','kts']):                          KotlinHighlighter,
+        frozenset(['swift']):                             SwiftHighlighter,
+        frozenset(['dockerfile']):                        DockerHighlighter,
+        frozenset(['toml']):                              TOMLHighlighter,
+    }
+    for exts, cls in EXT_MAP.items():
         if ext in exts:
             return cls(document)
+    return PythonHighlighter(document)
 
-    return PythonHighlighter(document)  # 預設
-
-# ───────────────────────────── Git 對話框 ─────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  Git 對話框
+# ══════════════════════════════════════════════════════════════════════
 class GitDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Git 操作")
         self.setMinimumWidth(500)
@@ -1307,15 +1269,17 @@ class GitDialog(QDialog):
 
         self.output = QTextEdit()
         self.output.setReadOnly(True)
-        self.output.setStyleSheet("background:#1e1e1e; color:#d4d4d4; font-family:monospace;")
+        self.output.setStyleSheet(
+            "background:#1e1e1e; color:#d4d4d4; font-family:monospace;")
 
         self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("輸入 Git 指令（如 status, commit -m 'msg', log --oneline）")
+        self.command_input.setPlaceholderText(
+            "輸入 Git 指令（如 status, commit -m 'msg', log --oneline）")
         self.command_input.returnPressed.connect(self.run_command)
 
         btn_layout = QHBoxLayout()
         for label, cmd in [("Status", "status"), ("Log", "log --oneline -10"),
-                            ("Diff", "diff"), ("Pull", "pull"), ("Push", "push")]:
+                            ("Diff",  "diff"),    ("Pull", "pull"), ("Push", "push")]:
             btn = QPushButton(label)
             btn.clicked.connect(lambda _, c=cmd: self._quick_run(c))
             btn_layout.addWidget(btn)
@@ -1335,11 +1299,11 @@ class GitDialog(QDialog):
         layout.addWidget(self.output)
         self.setLayout(layout)
 
-    def _quick_run(self, cmd):
+    def _quick_run(self, cmd: str) -> None:
         self.command_input.setText(cmd)
         self.run_command()
 
-    def run_command(self):
+    def run_command(self) -> None:
         command = self.command_input.text().strip()
         if not command:
             return
@@ -1352,18 +1316,21 @@ class GitDialog(QDialog):
             if result.stderr:
                 self.output.append(f'<span style="color:#f48771">{result.stderr}</span>')
         except FileNotFoundError:
-            self.output.append('<span style="color:#f48771">找不到 git，請確認已安裝 Git。</span>')
+            self.output.append(
+                '<span style="color:#f48771">找不到 git，請確認已安裝 Git。</span>')
 
-# ───────────────────────────── 主視窗 ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  主視窗
+# ══════════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PyEditor")
         self.setGeometry(100, 100, 1280, 800)
-        self.editor_widgets = {}
-        self.recent_files = []
-        self.current_font_size = 13
-        self.is_dark_theme = True
+        self.editor_widgets: dict[QWidget, CodeEditor] = {}
+        self.recent_files:   list[str]                 = []
+        self.current_font_size: int                    = 13
+        self.is_dark_theme: bool                       = True
         self.settings = QSettings("PyEditor", "PyEditor")
         self._load_settings()
         self._build_ui()
@@ -1373,7 +1340,7 @@ class MainWindow(QMainWindow):
         self._setup_autosave()
         self._apply_theme()
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         self.splitter = QSplitter(Qt.Horizontal)
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath(QDir.homePath())
@@ -1392,7 +1359,6 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._update_status)
         self.terminal = TerminalWidget()
         self.terminal.setMaximumHeight(200)
-
         center_splitter.addWidget(self.tabs)
         center_splitter.addWidget(self.terminal)
         center_splitter.setSizes([600, 150])
@@ -1402,43 +1368,48 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([220, 1060])
         self.setCentralWidget(self.splitter)
 
-    def _build_menu(self):
+    def _build_menu(self) -> None:
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("檔案")
-        self._add_action(file_menu, "新增檔案", self.new_file, "Ctrl+N")
-        self._add_action(file_menu, "開啟檔案", self.open_file, "Ctrl+O")
+        self._add_action(file_menu, "新增檔案",  self.new_file,     "Ctrl+N")
+        self._add_action(file_menu, "開啟檔案",  self.open_file,    "Ctrl+O")
         self.recent_menu = file_menu.addMenu("最近開啟")
         self._refresh_recent_menu()
-        self._add_action(file_menu, "儲存", self.save_file, "Ctrl+S")
-        self._add_action(file_menu, "另存新檔", self.save_file_as, "Ctrl+Shift+S")
+        self._add_action(file_menu, "儲存",      self.save_file,    "Ctrl+S")
+        self._add_action(file_menu, "另存新檔",  self.save_file_as, "Ctrl+Shift+S")
         file_menu.addSeparator()
-        self._add_action(file_menu, "離開", self.close, "Ctrl+Q")
+        self._add_action(file_menu, "離開",      self.close,        "Ctrl+Q")
 
         edit_menu = menubar.addMenu("編輯")
-        self._add_action(edit_menu, "復原", self.undo, "Ctrl+Z")
-        self._add_action(edit_menu, "取消復原", self.redo, "Ctrl+Y")
+        self._add_action(edit_menu, "復原",      self.undo,         "Ctrl+Z")
+        self._add_action(edit_menu, "取消復原",  self.redo,         "Ctrl+Y")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "搜尋", self.open_search, "Ctrl+F")
-        self._add_action(edit_menu, "取代", self.open_replace, "Ctrl+H")
+        self._add_action(edit_menu, "搜尋",      self.open_search,  "Ctrl+F")
+        self._add_action(edit_menu, "取代",      self.open_replace, "Ctrl+H")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "跳到指定行", self.goto_line, "Ctrl+L")
-        self._add_action(edit_menu, "全選", lambda: self._current_editor() and self._current_editor().selectAll(), "Ctrl+A")
+        self._add_action(edit_menu, "跳到指定行", self.goto_line,   "Ctrl+L")
+        self._add_action(edit_menu, "全選",
+            lambda: self._current_editor() and self._current_editor().selectAll(), "Ctrl+A")
         edit_menu.addSeparator()
-        self._add_action(edit_menu, "縮排選取", lambda: self._current_editor() and self._current_editor()._indent_selection(False), "Tab")
-        self._add_action(edit_menu, "反縮排選取", lambda: self._current_editor() and self._current_editor()._indent_selection(True), "Shift+Tab")
-        self._add_action(edit_menu, "切換行註解", lambda: self._current_editor() and self._current_editor()._toggle_comment(), "Ctrl+/")
-        self._add_action(edit_menu, "選取下一個相同文字", lambda: self._current_editor() and self._current_editor()._select_next_occurrence(), "Ctrl+D")
+        self._add_action(edit_menu, "縮排選取",
+            lambda: self._current_editor() and self._current_editor()._indent_selection(False))
+        self._add_action(edit_menu, "反縮排選取",
+            lambda: self._current_editor() and self._current_editor()._indent_selection(True))
+        self._add_action(edit_menu, "切換行註解",
+            lambda: self._current_editor() and self._current_editor()._toggle_comment(), "Ctrl+/")
+        self._add_action(edit_menu, "選取下一個相同文字",
+            lambda: self._current_editor() and self._current_editor()._select_next_occurrence(), "Ctrl+D")
 
         view_menu = menubar.addMenu("檢視")
-        self._add_action(view_menu, "放大字型", self.zoom_in, "Ctrl++")
-        self._add_action(view_menu, "縮小字型", self.zoom_out, "Ctrl+-")
-        self._add_action(view_menu, "重置字型大小", self.zoom_reset, "Ctrl+0")
-        self._add_action(view_menu, "選擇字型", self.choose_font)
+        self._add_action(view_menu, "放大字型",   self.zoom_in,       "Ctrl++")
+        self._add_action(view_menu, "縮小字型",   self.zoom_out,      "Ctrl+-")
+        self._add_action(view_menu, "重置字型",   self.zoom_reset,    "Ctrl+0")
+        self._add_action(view_menu, "選擇字型",   self.choose_font)
         view_menu.addSeparator()
         self._add_action(view_menu, "切換亮/暗主題", self.toggle_theme, "Ctrl+T")
         view_menu.addSeparator()
-        self._add_action(view_menu, "切換側邊欄", self.toggle_sidebar, "Ctrl+B")
+        self._add_action(view_menu, "切換側邊欄", self.toggle_sidebar,  "Ctrl+B")
         self._add_action(view_menu, "切換終端機", self.toggle_terminal, "Ctrl+`")
 
         run_menu = menubar.addMenu("執行")
@@ -1447,20 +1418,20 @@ class MainWindow(QMainWindow):
         git_menu = menubar.addMenu("Git")
         self._add_action(git_menu, "Git 操作面板", self.open_git_dialog, "Ctrl+Shift+G")
 
-    def _build_toolbar(self):
+    def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具列")
         toolbar.setIconSize(QSize(16, 16))
         self.addToolBar(toolbar)
         for label, slot in [
-            ("新增", self.new_file), ("開啟", self.open_file), ("儲存", self.save_file),
-            ("|", None),
-            ("↩ 復原", self.undo), ("↪ 取消復原", self.redo),
-            ("|", None),
+            ("新增", self.new_file),   ("開啟", self.open_file),  ("儲存", self.save_file),
+            ("|",   None),
+            ("↩",  self.undo),        ("↪",   self.redo),
+            ("|",   None),
             ("搜尋", self.open_search), ("取代", self.open_replace),
-            ("|", None),
-            ("執行 ▶", self.run_python), ("Git", self.open_git_dialog),
-            ("|", None),
-            ("A+", self.zoom_in), ("A-", self.zoom_out), ("主題", self.toggle_theme),
+            ("|",   None),
+            ("▶ 執行", self.run_python), ("Git", self.open_git_dialog),
+            ("|",   None),
+            ("A+",  self.zoom_in),    ("A-",  self.zoom_out),   ("主題", self.toggle_theme),
         ]:
             if label == "|":
                 toolbar.addSeparator()
@@ -1470,23 +1441,23 @@ class MainWindow(QMainWindow):
                     act.triggered.connect(slot)
                 toolbar.addAction(act)
 
-    def _build_status_bar(self):
+    def _build_status_bar(self) -> None:
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_label = QLabel("行 1, 欄 1")
-        self.file_label = QLabel("未命名")
+        self.status_label   = QLabel("行 1, 欄 1")
+        self.file_label     = QLabel("未命名")
         self.encoding_label = QLabel("UTF-8")
         self.status_bar.addWidget(self.file_label)
         self.status_bar.addPermanentWidget(self.encoding_label)
         self.status_bar.addPermanentWidget(self.status_label)
 
-    def _setup_autosave(self):
+    def _setup_autosave(self) -> None:
         self.autosave_timer = QTimer()
-        self.autosave_timer.setInterval(30000)
+        self.autosave_timer.setInterval(30_000)
         self.autosave_timer.timeout.connect(self._autosave)
         self.autosave_timer.start()
 
-    def _add_action(self, menu, name, slot, shortcut=None):
+    def _add_action(self, menu, name: str, slot, shortcut: Optional[str] = None) -> QAction:
         action = QAction(name, self)
         if shortcut:
             action.setShortcut(shortcut)
@@ -1494,41 +1465,40 @@ class MainWindow(QMainWindow):
         menu.addAction(action)
         return action
 
-    def _current_tab(self):
+    def _current_tab(self) -> Optional[QWidget]:
         return self.tabs.currentWidget()
 
-    def _current_editor(self):
+    def _current_editor(self) -> Optional[CodeEditor]:
         tab = self._current_tab()
-        return self.editor_widgets.get(tab)
+        return self.editor_widgets.get(tab) if tab else None
 
-    def _new_editor(self):
+    def _new_editor(self) -> CodeEditor:
         editor = CodeEditor()
-        font = QFont("Consolas", self.current_font_size)
-        editor.setFont(font)
+        editor.setFont(QFont("Consolas", self.current_font_size))
         editor.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
         editor.cursorPositionChanged.connect(self._update_status)
         editor.document().modificationChanged.connect(self._on_modification_changed)
         return editor
 
-    def _update_status(self):
+    def _update_status(self) -> None:
         editor = self._current_editor()
         if editor:
             cursor = editor.textCursor()
-            line = cursor.blockNumber() + 1
-            col = cursor.columnNumber() + 1
-            self.status_label.setText(f"行 {line}, 欄 {col}")
-            tab = self._current_tab()
+            self.status_label.setText(
+                f"行 {cursor.blockNumber()+1}, 欄 {cursor.columnNumber()+1}")
+            tab  = self._current_tab()
             path = getattr(tab, 'file_path', '未命名')
-            self.file_label.setText(QFileInfo(path).fileName() if path != '未命名' else '未命名')
+            self.file_label.setText(
+                QFileInfo(path).fileName() if path != '未命名' else '未命名')
 
-    def _on_modification_changed(self, modified):
+    def _on_modification_changed(self, modified: bool) -> None:
         tab = self._current_tab()
         if tab:
-            idx = self.tabs.indexOf(tab)
+            idx   = self.tabs.indexOf(tab)
             title = self.tabs.tabText(idx).rstrip(" ●")
             self.tabs.setTabText(idx, title + (" ●" if modified else ""))
 
-    def new_file(self):
+    def new_file(self) -> None:
         tab = QWidget()
         tab.file_path = '未命名'
         editor = self._new_editor()
@@ -1539,9 +1509,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab, "未命名")
         self.tabs.setCurrentWidget(tab)
 
-    def open_file(self, path=None):
+    def open_file(self, path: Optional[str] = None) -> None:
         if not path:
-            path, _ = QFileDialog.getOpenFileName(self, "開啟檔案", "",
+            path, _ = QFileDialog.getOpenFileName(
+                self, "開啟檔案", "",
                 "所有檔案 (*);;Python (*.py);;JavaScript (*.js);;HTML (*.html *.htm)")
         if not path:
             return
@@ -1551,41 +1522,43 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "錯誤", f"無法開啟檔案：{e}")
             return
+
         tab = QWidget()
         tab.file_path = path
         editor = self._new_editor()
         editor.highlighter = get_highlighter_for_file(path, editor.document())
         editor.setPlainText(content)
         editor.document().setModified(False)
+
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(editor)
         self.editor_widgets[tab] = editor
-        name = QFileInfo(path).fileName()
-        self.tabs.addTab(tab, name)
+        self.tabs.addTab(tab, QFileInfo(path).fileName())
         self.tabs.setCurrentWidget(tab)
         self._add_recent(path)
 
-    def open_from_tree(self, index):
+    def open_from_tree(self, index) -> None:
         path = self.file_model.filePath(index)
         if os.path.isfile(path):
             self.open_file(path)
 
-    def save_file(self):
+    def save_file(self) -> None:
         tab = self._current_tab()
         if not tab:
             return
         path = getattr(tab, 'file_path', '未命名')
         if path == '未命名':
             self.save_file_as()
-            return
-        self._write_file(tab, path)
+        else:
+            self._write_file(tab, path)
 
-    def save_file_as(self):
+    def save_file_as(self) -> None:
         tab = self._current_tab()
         if not tab:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "另存新檔", "",
+        path, _ = QFileDialog.getSaveFileName(
+            self, "另存新檔", "",
             "所有檔案 (*);;Python (*.py);;JavaScript (*.js);;HTML (*.html)")
         if path:
             tab.file_path = path
@@ -1593,7 +1566,7 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(self.tabs.currentIndex(), QFileInfo(path).fileName())
             self._add_recent(path)
 
-    def _write_file(self, tab, path):
+    def _write_file(self, tab: QWidget, path: str) -> None:
         editor = self.editor_widgets.get(tab)
         if not editor:
             return
@@ -1605,26 +1578,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "錯誤", f"儲存失敗：{e}")
 
-    def _autosave(self):
+    def _autosave(self) -> None:
         for tab, editor in self.editor_widgets.items():
             path = getattr(tab, 'file_path', '未命名')
             if path != '未命名' and editor.document().isModified():
                 self._write_file(tab, path)
                 self.status_bar.showMessage("自動儲存完成", 2000)
 
-    def close_tab(self, index):
-        tab = self.tabs.widget(index)
+    def close_tab(self, index: int) -> None:
+        tab    = self.tabs.widget(index)
         editor = self.editor_widgets.get(tab)
         if editor and editor.document().isModified():
-            reply = QMessageBox.question(self, "確認", "檔案已修改，確定要關閉嗎？",
-                                         QMessageBox.Yes | QMessageBox.No)
+            reply = QMessageBox.question(
+                self, "確認", "檔案已修改，確定要關閉嗎？",
+                QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No:
                 return
         if tab in self.editor_widgets:
             del self.editor_widgets[tab]
         self.tabs.removeTab(index)
 
-    def _add_recent(self, path):
+    def _add_recent(self, path: str) -> None:
         if path in self.recent_files:
             self.recent_files.remove(path)
         self.recent_files.insert(0, path)
@@ -1632,7 +1606,7 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
         self._save_settings()
 
-    def _refresh_recent_menu(self):
+    def _refresh_recent_menu(self) -> None:
         self.recent_menu.clear()
         if not self.recent_files:
             self.recent_menu.addAction("（無紀錄）").setEnabled(False)
@@ -1642,34 +1616,34 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda _, p=path: self.open_file(p))
             self.recent_menu.addAction(action)
 
-    def undo(self):
+    def undo(self) -> None:
         editor = self._current_editor()
         if editor:
             editor.undo()
 
-    def redo(self):
+    def redo(self) -> None:
         editor = self._current_editor()
         if editor:
             editor.redo()
 
-    def open_search(self):
+    def open_search(self) -> None:
         editor = self._current_editor()
         if editor:
             dlg = SearchDialog(editor)
             dlg.setParent(self, Qt.Dialog)
             dlg.show()
 
-    def open_replace(self):
+    def open_replace(self) -> None:
         editor = self._current_editor()
         if editor:
-            dlg = ReplaceDialog(editor)
-            dlg.exec_()
+            ReplaceDialog(editor).exec_()
 
-    def goto_line(self):
+    def goto_line(self) -> None:
         editor = self._current_editor()
         if not editor:
             return
-        line, ok = QInputDialog.getInt(self, "跳到指定行", "行號：", 1, 1, editor.blockCount())
+        line, ok = QInputDialog.getInt(
+            self, "跳到指定行", "行號：", 1, 1, editor.blockCount())
         if ok:
             cursor = editor.textCursor()
             cursor.movePosition(QTextCursor.Start)
@@ -1678,26 +1652,26 @@ class MainWindow(QMainWindow):
             editor.setTextCursor(cursor)
             editor.setFocus()
 
-    def zoom_in(self):
+    def zoom_in(self) -> None:
         self.current_font_size = min(self.current_font_size + 1, 40)
         self._apply_font_size()
 
-    def zoom_out(self):
+    def zoom_out(self) -> None:
         self.current_font_size = max(self.current_font_size - 1, 6)
         self._apply_font_size()
 
-    def zoom_reset(self):
+    def zoom_reset(self) -> None:
         self.current_font_size = 13
         self._apply_font_size()
 
-    def _apply_font_size(self):
+    def _apply_font_size(self) -> None:
         for editor in self.editor_widgets.values():
             font = editor.font()
             font.setPointSize(self.current_font_size)
             editor.setFont(font)
         self._save_settings()
 
-    def choose_font(self):
+    def choose_font(self) -> None:
         editor = self._current_editor()
         if not editor:
             return
@@ -1707,12 +1681,12 @@ class MainWindow(QMainWindow):
             for e in self.editor_widgets.values():
                 e.setFont(font)
 
-    def toggle_theme(self):
+    def toggle_theme(self) -> None:
         self.is_dark_theme = not self.is_dark_theme
         self._apply_theme()
         self._save_settings()
 
-    def _apply_theme(self):
+    def _apply_theme(self) -> None:
         if self.is_dark_theme:
             self.setStyleSheet("""
                 QMainWindow, QWidget { background: #1e1e1e; color: #d4d4d4; }
@@ -1722,12 +1696,16 @@ class MainWindow(QMainWindow):
                 QMenu::item:selected { background: #094771; }
                 QToolBar { background: #333333; border: none; }
                 QTabWidget::pane { border: 1px solid #454545; }
-                QTabBar::tab { background: #2d2d2d; color: #cccccc; padding: 5px 12px; border: 1px solid #454545; }
-                QTabBar::tab:selected { background: #1e1e1e; color: #ffffff; border-bottom: 2px solid #007acc; }
+                QTabBar::tab { background: #2d2d2d; color: #cccccc;
+                               padding: 5px 12px; border: 1px solid #454545; }
+                QTabBar::tab:selected { background: #1e1e1e; color: #ffffff;
+                                        border-bottom: 2px solid #007acc; }
                 QTreeView { background: #252526; color: #cccccc; border: none; }
                 QStatusBar { background: #007acc; color: white; }
-                QLineEdit { background: #3c3c3c; color: #d4d4d4; border: 1px solid #555; padding: 2px; }
-                QPushButton { background: #0e639c; color: white; border: none; padding: 4px 12px; }
+                QLineEdit { background: #3c3c3c; color: #d4d4d4;
+                            border: 1px solid #555; padding: 2px; }
+                QPushButton { background: #0e639c; color: white;
+                              border: none; padding: 4px 12px; }
                 QPushButton:hover { background: #1177bb; }
             """)
             editor_style = "background:#1e1e1e; color:#d4d4d4;"
@@ -1743,21 +1721,23 @@ class MainWindow(QMainWindow):
                 QTabBar::tab:selected { background: #ffffff; border-bottom: 2px solid #007acc; }
                 QTreeView { background: #f3f3f3; color: #333333; border: none; }
                 QStatusBar { background: #007acc; color: white; }
-                QLineEdit { background: #ffffff; color: #000000; border: 1px solid #aaa; padding: 2px; }
-                QPushButton { background: #0e639c; color: white; border: none; padding: 4px 12px; }
+                QLineEdit { background: #ffffff; color: #000000;
+                            border: 1px solid #aaa; padding: 2px; }
+                QPushButton { background: #0e639c; color: white;
+                              border: none; padding: 4px 12px; }
                 QPushButton:hover { background: #1177bb; }
             """)
             editor_style = "background:#ffffff; color:#000000;"
         for editor in self.editor_widgets.values():
             editor.setStyleSheet(editor_style)
 
-    def toggle_sidebar(self):
+    def toggle_sidebar(self) -> None:
         self.tree.setVisible(not self.tree.isVisible())
 
-    def toggle_terminal(self):
+    def toggle_terminal(self) -> None:
         self.terminal.setVisible(not self.terminal.isVisible())
 
-    def run_python(self):
+    def run_python(self) -> None:
         tab = self._current_tab()
         if not tab:
             return
@@ -1767,30 +1747,30 @@ class MainWindow(QMainWindow):
             return
         self.save_file()
         self.terminal.setVisible(True)
-        cmd = f"python3 \"{path}\"\n"
-        self.terminal.process.write(cmd.encode())
+        self.terminal.process.write(f'python3 "{path}"\n'.encode())
 
-    def open_git_dialog(self):
-        dlg = GitDialog(self)
-        dlg.exec_()
+    def open_git_dialog(self) -> None:
+        GitDialog(self).exec_()
 
-    def _save_settings(self):
-        self.settings.setValue("recent_files", self.recent_files)
-        self.settings.setValue("font_size", self.current_font_size)
-        self.settings.setValue("dark_theme", self.is_dark_theme)
+    def _save_settings(self) -> None:
+        self.settings.setValue("recent_files",  self.recent_files)
+        self.settings.setValue("font_size",     self.current_font_size)
+        self.settings.setValue("dark_theme",    self.is_dark_theme)
 
-    def _load_settings(self):
-        self.recent_files = self.settings.value("recent_files", []) or []
+    def _load_settings(self) -> None:
+        self.recent_files      = self.settings.value("recent_files", []) or []
         self.current_font_size = int(self.settings.value("font_size", 13))
-        self.is_dark_theme = self.settings.value("dark_theme", True)
+        self.is_dark_theme     = self.settings.value("dark_theme", True)
         if isinstance(self.is_dark_theme, str):
             self.is_dark_theme = self.is_dark_theme.lower() != 'false'
 
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
         self._save_settings()
         super().closeEvent(event)
 
-# ───────────────────────────── 入口 ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  入口
+# ══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
