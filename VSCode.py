@@ -351,28 +351,36 @@ class TerminalWidget(QTextEdit):
         super().__init__()
         self.setStyleSheet(
             "background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 13px;")
+
         self.process = QProcess()
+        # 讓 stdout/stderr 合流，避免兩條 pipe 交錯
+        self.process.setProcessChannelMode(QProcess.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.read_output)
-        self.process.readyReadStandardError.connect(self.read_error)
         self.process.errorOccurred.connect(self._on_process_error)
+        # 進程啟動完成後才顯示提示字元，避免 write failed
+        self.process.started.connect(self._on_started)
+
         self._shell, self._shell_args = self._detect_shell()
         self.process.start(self._shell, self._shell_args)
-        self.append(f"[終端機：{self._shell}]\n$ ")
 
     @staticmethod
     def _detect_shell() -> tuple[str, list[str]]:
         if sys.platform == "win32":
-            git_bash_candidates = [
+            # Git Bash 優先（體驗更好）
+            for path in [
                 r"C:\Program Files\Git\bin\bash.exe",
                 r"C:\Program Files (x86)\Git\bin\bash.exe",
-            ]
-            for path in git_bash_candidates:
+            ]:
                 if os.path.exists(path):
                     return path, []
-            return "cmd.exe", ["/K"]
+            # 沒有 Git Bash 就用 cmd.exe（不加 /K，用 pipe 模式）
+            return "cmd.exe", []
         else:
-            shell = os.environ.get("SHELL", "bash")
-            return shell, []
+            return os.environ.get("SHELL", "bash"), []
+
+    def _on_started(self) -> None:
+        """Shell 真正啟動後才顯示提示字元。"""
+        self.append(f"[終端機：{self._shell}]\n$ ")
 
     def _on_process_error(self, error) -> None:
         msgs = {
@@ -390,14 +398,34 @@ class TerminalWidget(QTextEdit):
     def read_output(self) -> None:
         data = self.process.readAllStandardOutput().data().decode(errors='replace')
         self.insertPlainText(data)
-        self.append("$ ")
 
-    def read_error(self) -> None:
-        data = self.process.readAllStandardError().data().decode(errors='replace')
-        self.setTextColor(QColor("#f48771"))
-        self.insertPlainText(data)
-        self.setTextColor(QColor("#d4d4d4"))
-        self.append("$ ")
+    def shutdown(self) -> None:
+        """
+        由 MainWindow.closeEvent 呼叫，正確終止 shell：
+        - 先送 exit 指令讓 shell 自己退出（優雅）
+        - 等最多 2 秒
+        - 還活著就強制 kill
+        """
+        proc = self.process
+        if proc.state() == QProcess.NotRunning:
+            return
+        try:
+            # 送 exit 讓 shell 自己結束
+            if sys.platform == "win32":
+                proc.write(b"exit\r\n")
+            else:
+                proc.write(b"exit\n")
+            proc.closeWriteChannel()          # 關 stdin，通知 shell 沒有更多輸入
+            if not proc.waitForFinished(2000):
+                proc.terminate()
+                if not proc.waitForFinished(1000):
+                    proc.kill()
+                    proc.waitForFinished(500)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -1985,13 +2013,9 @@ class MainWindow(QMainWindow):
         關閉視窗時統一銷毀所有子進程，避免殭屍進程殘留。
         涵蓋：終端機 shell、影音播放器、HighlightWorker 執行緒。
         """
-        # 終端機 shell
+        # 終端機 shell（用 shutdown() 正確結束，避免 Destroyed while running）
         try:
-            proc = self.terminal.process
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-                if not proc.waitForFinished(1000):
-                    proc.kill()
+            self.terminal.shutdown()
         except Exception:
             pass
 
