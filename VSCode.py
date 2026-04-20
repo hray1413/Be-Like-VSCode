@@ -7,7 +7,7 @@ import sys
 from typing import Optional
 
 from PyQt5.QtCore import (QDir, QFileInfo, QProcess, QSettings, QSize,
-                           QThread, QTimer, Qt, pyqtSignal)
+                           QThread, QTimer, Qt, pyqtSignal, QUrl)
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QPainter,
                          QSyntaxHighlighter, QTextCharFormat, QTextCursor,
                          QTextFormat)
@@ -18,7 +18,13 @@ from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QCompleter,
                               QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                               QPushButton, QSplitter, QStatusBar, QTabWidget,
                               QTextBrowser, QTextEdit, QToolBar, QTreeView,
-                              QVBoxLayout, QWidget)
+                              QVBoxLayout, QWidget, QSlider, QStyle)
+try:
+    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+    from PyQt5.QtMultimediaWidgets import QVideoWidget
+    HAS_MULTIMEDIA = True
+except ImportError:
+    HAS_MULTIMEDIA = False
 
 # ══════════════════════════════════════════════════════════════════════
 #  型態別名
@@ -66,8 +72,8 @@ class SearchWorker(QThread):
 
 
 class SearchDialog(QDialog):
-    def __init__(self, editor: CodeEditor) -> None:
-        super().__init__()
+    def __init__(self, editor: CodeEditor, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
         self.editor  = editor
         self._worker: Optional[SearchWorker] = None
         self._main_window: Optional[MainWindow] = None
@@ -234,8 +240,8 @@ class SearchDialog(QDialog):
 #  取代對話框
 # ══════════════════════════════════════════════════════════════════════
 class ReplaceDialog(QDialog):
-    def __init__(self, editor: CodeEditor) -> None:
-        super().__init__()
+    def __init__(self, editor: CodeEditor, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
         self.editor = editor
         self.setWindowTitle("搜尋與取代")
         self.setMinimumWidth(480)
@@ -348,8 +354,38 @@ class TerminalWidget(QTextEdit):
         self.process = QProcess()
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.readyReadStandardError.connect(self.read_error)
-        self.process.start("bash")
-        self.append("$ ")
+        self.process.errorOccurred.connect(self._on_process_error)
+        self._shell, self._shell_args = self._detect_shell()
+        self.process.start(self._shell, self._shell_args)
+        self.append(f"[終端機：{self._shell}]\n$ ")
+
+    @staticmethod
+    def _detect_shell() -> tuple[str, list[str]]:
+        if sys.platform == "win32":
+            git_bash_candidates = [
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Program Files (x86)\Git\bin\bash.exe",
+            ]
+            for path in git_bash_candidates:
+                if os.path.exists(path):
+                    return path, []
+            return "cmd.exe", ["/K"]
+        else:
+            shell = os.environ.get("SHELL", "bash")
+            return shell, []
+
+    def _on_process_error(self, error) -> None:
+        msgs = {
+            QProcess.FailedToStart: "找不到 shell 程式，請確認已安裝 Git Bash 或 cmd 可用。",
+            QProcess.Crashed:       "Shell 程式意外結束。",
+            QProcess.Timedout:      "Shell 啟動逾時。",
+            QProcess.WriteError:    "無法寫入 shell（管道錯誤）。",
+            QProcess.ReadError:     "無法讀取 shell 輸出。",
+        }
+        msg = msgs.get(error, f"未知錯誤（代碼 {error}）")
+        self.setTextColor(QColor("#f48771"))
+        self.append(f"[錯誤] {msg}")
+        self.setTextColor(QColor("#d4d4d4"))
 
     def read_output(self) -> None:
         data = self.process.readAllStandardOutput().data().decode(errors='replace')
@@ -569,7 +605,7 @@ class CodeEditor(QPlainTextEdit):
     def highlight_brackets(self) -> None:
         selections = []
         if not self.isReadOnly():
-            sel = QPlainTextEdit.ExtraSelection()
+            sel = QTextEdit.ExtraSelection()
             sel.format.setBackground(QColor(Qt.yellow).lighter(160))
             sel.format.setProperty(QTextFormat.FullWidthSelection, True)
             sel.cursor = self.textCursor()
@@ -1080,7 +1116,7 @@ class ShellHighlighter(BaseHighlighter):
                   'continue','exit','local','export','source','true','false'])
         self._kw(['echo','printf','read','cd','ls','pwd','mkdir','rm','cp',
                   'mv','cat','grep','sed','awk','find','sort','uniq','wc',
-                  'chmod','chown','sudo','apt','yum','pip','python3',
+                  'chmod','chown','sudo','apt','yum','pip','python',
                   'git','curl','wget','tar','zip','unzip'], color="#dcdcaa", bold=False)
         self._re(r"\$[{(]?[a-zA-Z_][\w]*[})]?", "#9cdcfe")
         self._re(r'"[^"]*"',                   "#ce9178")
@@ -1257,6 +1293,167 @@ def get_highlighter_for_file(path: str, document) -> BaseHighlighter:
             return cls(document)
     return PythonHighlighter(document)
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  影音播放器
+# ══════════════════════════════════════════════════════════════════════
+class MediaPlayerDialog(QDialog):
+    """
+    內建影音播放器。
+    支援：影片（mp4/mkv/avi/mov）、音樂（mp3/wav/flac/ogg/aac）。
+    需要 PyQt5.QtMultimedia（pip install PyQt5 時通常已包含）。
+    Windows 上需要安裝 K-Lite Codec Pack 或 LAV Filters 才能播放影片。
+    """
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("影音播放器")
+        self.setMinimumSize(640, 480)
+        self.resize(800, 560)
+
+        if not HAS_MULTIMEDIA:
+            layout = QVBoxLayout(self)
+            layout.addWidget(QLabel(
+                "❌ 缺少 PyQt5.QtMultimedia\n\n"
+                "請執行：pip install PyQt5\n"
+                "Windows 另需安裝 K-Lite Codec Pack 才能播放影片。"
+            ))
+            return
+
+        self._player = QMediaPlayer(self)
+        self._player.stateChanged.connect(self._on_state_changed)
+        self._player.durationChanged.connect(self._on_duration_changed)
+        self._player.positionChanged.connect(self._on_position_changed)
+        self._player.error.connect(self._on_error)
+
+        # ── 影像區 ──
+        self._video = QVideoWidget(self)
+        self._player.setVideoOutput(self._video)
+
+        # ── 控制列 ──
+        ctrl = QHBoxLayout()
+
+        self._btn_open = QPushButton("開啟")
+        self._btn_open.clicked.connect(self.open_file)
+        ctrl.addWidget(self._btn_open)
+
+        self._btn_play = QPushButton("▶")
+        self._btn_play.setFixedWidth(40)
+        self._btn_play.clicked.connect(self.toggle_play)
+        ctrl.addWidget(self._btn_play)
+
+        self._btn_stop = QPushButton("■")
+        self._btn_stop.setFixedWidth(40)
+        self._btn_stop.clicked.connect(self.stop)
+        ctrl.addWidget(self._btn_stop)
+
+        # 進度條
+        self._seek = QSlider(Qt.Horizontal)
+        self._seek.setRange(0, 0)
+        self._seek.sliderMoved.connect(self._player.setPosition)
+        ctrl.addWidget(self._seek, stretch=1)
+
+        self._lbl_time = QLabel("00:00 / 00:00")
+        self._lbl_time.setFixedWidth(110)
+        ctrl.addWidget(self._lbl_time)
+
+        # 音量
+        ctrl.addWidget(QLabel("🔊"))
+        self._vol = QSlider(Qt.Horizontal)
+        self._vol.setRange(0, 100)
+        self._vol.setValue(80)
+        self._vol.setFixedWidth(80)
+        self._vol.valueChanged.connect(self._player.setVolume)
+        ctrl.addWidget(self._vol)
+        self._player.setVolume(80)
+
+        # ── 檔名標籤 ──
+        self._lbl_file = QLabel("尚未開啟檔案")
+        self._lbl_file.setStyleSheet("color: #858585; font-size: 12px;")
+
+        # ── 錯誤標籤 ──
+        self._lbl_err = QLabel("")
+        self._lbl_err.setStyleSheet("color: #f48771;")
+        self._lbl_err.hide()
+
+        # ── 整體佈局 ──
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._video, stretch=1)
+        layout.addWidget(self._lbl_file)
+        layout.addWidget(self._lbl_err)
+        layout.addLayout(ctrl)
+
+    # ── 開啟檔案 ──
+    def open_file(self, path: Optional[str] = None) -> None:
+        if not HAS_MULTIMEDIA:
+            return
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "開啟影音檔", "",
+                "影音檔案 (*.mp4 *.mkv *.avi *.mov *.wmv *.flv "
+                "*.mp3 *.wav *.flac *.ogg *.aac *.m4a *.opus);;"
+                "所有檔案 (*)"
+            )
+        if not path:
+            return
+        self._lbl_err.hide()
+        self._lbl_file.setText(QFileInfo(path).fileName())
+        self._player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
+        self._player.play()
+
+    # ── 播放控制 ──
+    def toggle_play(self) -> None:
+        if not HAS_MULTIMEDIA:
+            return
+        if self._player.state() == QMediaPlayer.PlayingState:
+            self._player.pause()
+        else:
+            self._player.play()
+
+    def stop(self) -> None:
+        if HAS_MULTIMEDIA:
+            self._player.stop()
+
+    # ── Slots ──
+    def _on_state_changed(self, state: QMediaPlayer.State) -> None:
+        self._btn_play.setText(
+            "⏸" if state == QMediaPlayer.PlayingState else "▶")
+
+    def _on_duration_changed(self, duration: int) -> None:
+        self._seek.setRange(0, duration)
+        self._update_time_label(self._player.position(), duration)
+
+    def _on_position_changed(self, position: int) -> None:
+        self._seek.setValue(position)
+        self._update_time_label(position, self._player.duration())
+
+    def _on_error(self, error: QMediaPlayer.Error) -> None:
+        msgs = {
+            QMediaPlayer.ResourceError:   "找不到或無法讀取檔案。",
+            QMediaPlayer.FormatError:     "不支援的格式。Windows 請安裝 K-Lite Codec Pack。",
+            QMediaPlayer.NetworkError:    "網路錯誤。",
+            QMediaPlayer.AccessDeniedError: "無存取權限。",
+        }
+        msg = msgs.get(error, self._player.errorString())
+        self._lbl_err.setText(f"播放錯誤：{msg}")
+        self._lbl_err.show()
+
+    @staticmethod
+    def _fmt_ms(ms: int) -> str:
+        s  = ms // 1000
+        m  = s  // 60
+        s  = s  %  60
+        return f"{m:02d}:{s:02d}"
+
+    def _update_time_label(self, pos: int, dur: int) -> None:
+        self._lbl_time.setText(f"{self._fmt_ms(pos)} / {self._fmt_ms(dur)}")
+
+    def closeEvent(self, event) -> None:
+        """關閉時確保播放器停止並釋放資源。"""
+        if HAS_MULTIMEDIA:
+            self._player.stop()
+            self._player.setMedia(QMediaContent())
+        super().closeEvent(event)
+
 # ══════════════════════════════════════════════════════════════════════
 #  Git 對話框
 # ══════════════════════════════════════════════════════════════════════
@@ -1418,6 +1615,9 @@ class MainWindow(QMainWindow):
         git_menu = menubar.addMenu("Git")
         self._add_action(git_menu, "Git 操作面板", self.open_git_dialog, "Ctrl+Shift+G")
 
+        media_menu = menubar.addMenu("媒體")
+        self._add_action(media_menu, "影音播放器", self.open_media_player, "Ctrl+M")
+
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具列")
         toolbar.setIconSize(QSize(16, 16))
@@ -1429,7 +1629,7 @@ class MainWindow(QMainWindow):
             ("|",   None),
             ("搜尋", self.open_search), ("取代", self.open_replace),
             ("|",   None),
-            ("▶ 執行", self.run_python), ("Git", self.open_git_dialog),
+            ("▶ 執行", self.run_python), ("Git", self.open_git_dialog), ("🎵", self.open_media_player),
             ("|",   None),
             ("A+",  self.zoom_in),    ("A-",  self.zoom_out),   ("主題", self.toggle_theme),
         ]:
@@ -1629,14 +1829,14 @@ class MainWindow(QMainWindow):
     def open_search(self) -> None:
         editor = self._current_editor()
         if editor:
-            dlg = SearchDialog(editor)
-            dlg.setParent(self, Qt.Dialog)
+            dlg = SearchDialog(editor, parent=self)
             dlg.show()
 
     def open_replace(self) -> None:
         editor = self._current_editor()
         if editor:
-            ReplaceDialog(editor).exec_()
+            dlg = ReplaceDialog(editor, parent=self)
+            dlg.show()
 
     def goto_line(self) -> None:
         editor = self._current_editor()
@@ -1747,10 +1947,21 @@ class MainWindow(QMainWindow):
             return
         self.save_file()
         self.terminal.setVisible(True)
-        self.terminal.process.write(f'python3 "{path}"\n'.encode())
+        # Windows 用 python，其他平台用 python3
+        py = "python" if sys.platform == "win32" else "python3"
+        cmd = f'{py} "{path}"\n'.encode()
+        self.terminal.process.write(cmd)
 
     def open_git_dialog(self) -> None:
         GitDialog(self).exec_()
+
+    def open_media_player(self) -> None:
+        """開啟影音播放器視窗（非 modal，可同時編輯程式碼）。"""
+        if not hasattr(self, '_media_player_dlg') or self._media_player_dlg is None:
+            self._media_player_dlg = MediaPlayerDialog(parent=self)
+        self._media_player_dlg.show()
+        self._media_player_dlg.raise_()
+        self._media_player_dlg.activateWindow()
 
     def _save_settings(self) -> None:
         self.settings.setValue("recent_files",  self.recent_files)
@@ -1766,14 +1977,44 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_settings()
+        self._cleanup_processes()
         super().closeEvent(event)
 
-# ══════════════════════════════════════════════════════════════════════
-#  入口
-# ══════════════════════════════════════════════════════════════════════
+    def _cleanup_processes(self) -> None:
+        """
+        關閉視窗時統一銷毀所有子進程，避免殭屍進程殘留。
+        涵蓋：終端機 shell、影音播放器、HighlightWorker 執行緒。
+        """
+        # 終端機 shell
+        try:
+            proc = self.terminal.process
+            if proc.state() != QProcess.NotRunning:
+                proc.terminate()
+                if not proc.waitForFinished(1000):
+                    proc.kill()
+        except Exception:
+            pass
+
+        # 影音播放器
+        try:
+            if hasattr(self, '_media_player_dlg') and self._media_player_dlg:
+                self._media_player_dlg.close()
+        except Exception:
+            pass
+
+        # 所有 editor 的 HighlightWorker
+        for editor in self.editor_widgets.values():
+            try:
+                worker = getattr(editor.highlighter, '_worker', None)
+                if worker and worker.isRunning():
+                    worker.abort()
+                    worker.wait(500)
+            except Exception:
+                pass
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = MainWindow()
-    window.show()
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec_())
