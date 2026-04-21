@@ -481,6 +481,120 @@ class CodeEditor(QPlainTextEdit):
         self.completer.activated.connect(self.insert_completion)
         self.cursorPositionChanged.connect(self.highlight_brackets)
         self.verticalScrollBar().valueChanged.connect(self._notify_viewport)
+        # LSP state
+        self._diagnostics: list[dict]           = []
+        self._lsp_manager: "Optional[LspManager]" = None
+        self._file_path: str                    = ""
+        self._doc_version: int                  = 0
+
+        # Debounce didChange: 500ms after typing stops
+        self._lsp_debounce = QTimer()
+        self._lsp_debounce.setSingleShot(True)
+        self._lsp_debounce.setInterval(500)
+        self._lsp_debounce.timeout.connect(self._send_did_change)
+        self.document().contentsChanged.connect(self._lsp_debounce.start)
+
+        # Hover debounce: 800ms hover
+        self._hover_timer = QTimer()
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(800)
+        self._hover_timer.timeout.connect(self._send_hover)
+        self._hover_pos: Optional[tuple[int, int]] = None
+        self.setMouseTracking(True)
+
+    def attach_lsp(self, manager: "LspManager", path: str) -> None:
+        self._lsp_manager = manager
+        self._file_path   = path
+        manager.open_document(path, self.toPlainText())
+
+    def detach_lsp(self) -> None:
+        if self._lsp_manager and self._file_path:
+            self._lsp_manager.close_document(self._file_path)
+        self._lsp_manager = None
+        self._file_path   = ""
+
+    def set_diagnostics(self, diags: list) -> None:
+        self._diagnostics = diags
+        self._render_diagnostics()
+
+    def _render_diagnostics(self) -> None:
+        doc = self.document()
+        extra = []
+        for d in self._diagnostics:
+            line     = d["line"]
+            char     = d["char"]
+            end_line = d.get("end_line", line)
+            end_char = d.get("end_char", char + 1)
+            sev      = d.get("severity", "error")
+            color    = LSP_SEVERITY_COLOR.get(sev, "#f48771")
+
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.SpellCheckUnderline)
+            fmt.setUnderlineColor(QColor(color))
+
+            block_s = doc.findBlockByNumber(line)
+            block_e = doc.findBlockByNumber(end_line)
+            if not block_s.isValid():
+                continue
+            sel = QPlainTextEdit.ExtraSelection()
+            sel.format = fmt
+            c = QTextCursor(block_s)
+            c.movePosition(QTextCursor.StartOfBlock)
+            c.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, char)
+            end_pos = (block_e.position() + end_char
+                       if block_e.isValid() else c.position() + 1)
+            c.setPosition(end_pos, QTextCursor.KeepAnchor)
+            sel.cursor = c
+            extra.append(sel)
+        # merge with existing selections (bracket highlight, current line)
+        current = [s for s in self.extraSelections()
+                   if s.format.underlineStyle() != QTextCharFormat.SpellCheckUnderline]
+        self.setExtraSelections(current + extra)
+
+    def _send_did_change(self) -> None:
+        if self._lsp_manager and self._file_path:
+            self._lsp_manager.change_document(self._file_path, self.toPlainText())
+
+    def _send_hover(self) -> None:
+        if not self._lsp_manager or not self._file_path or not self._hover_pos:
+            return
+        line, char = self._hover_pos
+        self._lsp_manager.request_hover(self._file_path, line, char)
+
+    def apply_lsp_completion(self, items: list) -> None:
+        if not items:
+            return
+        from PyQt5.QtCore import QStringListModel
+        labels = [i["label"] for i in items]
+        self.completer.setModel(QStringListModel(labels))
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.WordUnderCursor)
+        prefix = cursor.selectedText()
+        self.completer.setCompletionPrefix(prefix)
+        cr = self.cursorRect()
+        cr.setWidth(self.completer.popup().sizeHintForColumn(0)
+                    + self.completer.popup().verticalScrollBar().sizeHint().width())
+        self.completer.complete(cr)
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if self._lsp_manager and self._file_path:
+            cursor = self.cursorForPosition(event.pos())
+            self._hover_pos = (cursor.blockNumber(), cursor.columnNumber())
+            self._hover_timer.start()
+
+    def mousePressEvent(self, event) -> None:
+        # Ctrl+Click => go to definition
+        if (event.button() == Qt.LeftButton
+                and event.modifiers() == Qt.ControlModifier
+                and self._lsp_manager and self._file_path):
+            cursor = self.cursorForPosition(event.pos())
+            self._lsp_manager.request_definition(
+                self._file_path,
+                cursor.blockNumber(),
+                cursor.columnNumber())
+            return
+        super().mousePressEvent(event)
 
     def _notify_viewport(self, *_) -> None:
         """計算目前可見行號範圍並通知 highlighter。"""
@@ -1322,6 +1436,1190 @@ def get_highlighter_for_file(path: str, document) -> BaseHighlighter:
     return PythonHighlighter(document)
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  插件系統
+#
+#  架構：
+#    PluginSandbox        — 限制 __builtins__，白名單 import
+#    PluginAPI            — 插件可呼叫的所有方法
+#    PluginManager        — 掃描 plugins/、載入、管理生命週期
+#    PluginStore          — 從 GitHub Releases 抓 index.json / 下載
+#    PluginManagerDialog  — UI：已安裝 / 商店 / 啟用停用
+#
+#  插件格式（單一 .py 檔）：
+#    PLUGIN_META = {
+#        "name": "我的插件",
+#        "version": "1.0.0",
+#        "description": "做一些很酷的事",
+#        "author": "你的名字",
+#    }
+#    def register(api):
+#        api.add_menu_item("工具/做某事", my_func)
+#        api.add_shortcut("Ctrl+Shift+X", my_func)
+#        api.on_save(lambda path, text: ...)
+#        api.on_open(lambda path, text: ...)
+#
+#  固定來源（GitHub Releases）：
+#    PLUGIN_REGISTRY_URL 指向你自己的 repo releases 的 index.json
+# ══════════════════════════════════════════════════════════════════════
+import importlib.util
+import hashlib
+import urllib.request
+import urllib.error
+import zipfile
+import shutil
+import textwrap
+
+# 固定插件來源：改成你自己的 GitHub repo
+PLUGIN_REGISTRY_URL = (
+    "https://raw.githubusercontent.com/"
+    "yourname/pyeditor-plugins/main/index.json"
+)
+PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+
+# 允許插件使用的標準函式庫模組白名單
+ALLOWED_MODULES: set[str] = {
+    "re", "os.path", "json", "math", "datetime", "collections",
+    "itertools", "functools", "string", "textwrap", "unicodedata",
+    "pathlib", "typing", "dataclasses", "enum", "copy", "time",
+}
+
+# ── 沙盒 __builtins__ ──────────────────────────────────────────────────
+_SAFE_BUILTINS = {
+    k: v for k, v in __builtins__.items()
+    if k in {
+        "print", "len", "range", "enumerate", "zip", "map", "filter",
+        "sorted", "reversed", "list", "dict", "set", "tuple", "str",
+        "int", "float", "bool", "bytes", "type", "isinstance", "issubclass",
+        "hasattr", "getattr", "setattr", "callable", "repr", "abs",
+        "min", "max", "sum", "round", "any", "all", "chr", "ord",
+        "hex", "oct", "bin", "hash", "id", "iter", "next", "vars",
+        "True", "False", "None", "NotImplemented", "Ellipsis",
+        "Exception", "ValueError", "TypeError", "KeyError",
+        "IndexError", "AttributeError", "StopIteration",
+    }
+} if isinstance(__builtins__, dict) else {
+    k: getattr(__builtins__, k)
+    for k in dir(__builtins__)
+    if k in {
+        "print", "len", "range", "enumerate", "zip", "map", "filter",
+        "sorted", "reversed", "list", "dict", "set", "tuple", "str",
+        "int", "float", "bool", "bytes", "type", "isinstance", "issubclass",
+        "hasattr", "getattr", "setattr", "callable", "repr", "abs",
+        "min", "max", "sum", "round", "any", "all", "chr", "ord",
+        "hex", "oct", "bin", "hash", "id", "iter", "next", "vars",
+        "True", "False", "None", "NotImplemented", "Ellipsis",
+        "Exception", "ValueError", "TypeError", "KeyError",
+        "IndexError", "AttributeError", "StopIteration",
+    }
+}
+
+
+class PluginSandbox:
+    """
+    在受限的執行環境中載入插件。
+    - __builtins__ 限制在白名單
+    - __import__ 只允許 ALLOWED_MODULES 中的模組
+    - 不允許 open()、exec()、eval()、__import__ 任意模組
+    """
+
+    @staticmethod
+    def _make_restricted_import(allowed: set[str]):
+        def _import(name, globals=None, locals=None, fromlist=(), level=0):
+            base = name.split(".")[0]
+            if name not in allowed and base not in allowed:
+                raise ImportError(
+                    f"插件不允許 import '{name}'。"
+                    f"允許的模組：{sorted(allowed)}"
+                )
+            return __import__(name, globals, locals, fromlist, level)
+        return _import
+
+    @classmethod
+    def execute(cls, source: str, filename: str, api: "PluginAPI") -> dict:
+        """
+        在沙盒中執行插件 source，回傳插件的 globals dict。
+        插件應在 globals 中定義 PLUGIN_META 和 register(api)。
+        """
+        safe_globals: dict = {
+            "__builtins__": {
+                **_SAFE_BUILTINS,
+                "__import__": cls._make_restricted_import(ALLOWED_MODULES),
+            },
+            "__name__":   filename,
+            "__file__":   filename,
+        }
+        try:
+            code = compile(source, filename, "exec")
+            exec(code, safe_globals)
+        except ImportError as e:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"插件載入錯誤：{e}") from e
+
+        # 呼叫 register(api)
+        register_fn = safe_globals.get("register")
+        if callable(register_fn):
+            try:
+                register_fn(api)
+            except Exception as e:
+                raise RuntimeError(f"插件 register() 錯誤：{e}") from e
+
+        return safe_globals
+
+
+# ── 插件 API ──────────────────────────────────────────────────────────
+class PluginAPI:
+    """
+    插件能呼叫的所有方法。
+    主視窗的內部邏輯不暴露給插件，插件只能透過這個介面操作。
+    """
+
+    def __init__(self, main_window: "MainWindow") -> None:
+        self._mw             = main_window
+        self._menu_actions:  list[QAction]   = []
+        self._shortcuts:     list[QShortcut] = []
+        self._on_save_cbs:   list            = []
+        self._on_open_cbs:   list            = []
+
+    # ── 讀寫編輯器內容 ────────────────────────────────────────────────
+    def get_text(self) -> str:
+        editor = self._mw._current_editor()
+        return editor.toPlainText() if editor else ""
+
+    def set_text(self, text: str) -> None:
+        editor = self._mw._current_editor()
+        if editor:
+            cursor = editor.textCursor()
+            cursor.select(QTextCursor.Document)
+            cursor.insertText(text)
+
+    def get_selection(self) -> str:
+        editor = self._mw._current_editor()
+        return editor.textCursor().selectedText() if editor else ""
+
+    def set_selection(self, text: str) -> None:
+        editor = self._mw._current_editor()
+        if editor:
+            editor.textCursor().insertText(text)
+
+    def get_cursor_position(self) -> tuple[int, int]:
+        editor = self._mw._current_editor()
+        if not editor:
+            return (0, 0)
+        c = editor.textCursor()
+        return (c.blockNumber(), c.columnNumber())
+
+    def get_file_path(self) -> str:
+        tab = self._mw._current_tab()
+        return getattr(tab, "file_path", "") if tab else ""
+
+    # ── UI 擴充 ───────────────────────────────────────────────────────
+    def add_menu_item(self, path: str, callback, shortcut: str = "") -> None:
+        """
+        在選單中加入項目。
+        path 格式：「工具/格式化代碼」→ 在「工具」選單下加「格式化代碼」。
+        若最上層選單不存在則自動建立。
+        """
+        parts    = path.split("/", 1)
+        top_name = parts[0]
+        item_name = parts[1] if len(parts) > 1 else parts[0]
+
+        menubar = self._mw.menuBar()
+        # 找或建立頂層選單
+        target_menu = None
+        for action in menubar.actions():
+            if action.text() == top_name:
+                target_menu = action.menu()
+                break
+        if target_menu is None:
+            target_menu = menubar.addMenu(top_name)
+
+        action = QAction(item_name, self._mw)
+        if shortcut:
+            action.setShortcut(shortcut)
+        action.triggered.connect(lambda: self._safe_call(callback))
+        target_menu.addAction(action)
+        self._menu_actions.append(action)
+
+    def add_shortcut(self, key: str, callback) -> None:
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        sc = QShortcut(QKeySequence(key), self._mw)
+        sc.activated.connect(lambda: self._safe_call(callback))
+        self._shortcuts.append(sc)
+
+    def show_message(self, title: str, text: str) -> None:
+        QMessageBox.information(self._mw, title, text)
+
+    def show_status(self, text: str, timeout: int = 3000) -> None:
+        self._mw.status_bar.showMessage(text, timeout)
+
+    def ask_input(self, title: str, prompt: str, default: str = "") -> Optional[str]:
+        text, ok = QInputDialog.getText(self._mw, title, prompt, text=default)
+        return text if ok else None
+
+    # ── 事件 hooks ────────────────────────────────────────────────────
+    def on_save(self, callback) -> None:
+        """callback(path: str, text: str) -> None"""
+        self._on_save_cbs.append(callback)
+
+    def on_open(self, callback) -> None:
+        """callback(path: str, text: str) -> None"""
+        self._on_open_cbs.append(callback)
+
+    # ── 內部：觸發 hooks（由 PluginManager 呼叫）─────────────────────
+    def _fire_save(self, path: str, text: str) -> None:
+        for cb in self._on_save_cbs:
+            self._safe_call(cb, path, text)
+
+    def _fire_open(self, path: str, text: str) -> None:
+        for cb in self._on_open_cbs:
+            self._safe_call(cb, path, text)
+
+    def _safe_call(self, fn, *args) -> None:
+        try:
+            fn(*args)
+        except Exception as e:
+            QMessageBox.warning(
+                self._mw, "插件錯誤",
+                f"插件執行時發生錯誤：\n{e}")
+
+    def _unregister(self) -> None:
+        """移除這個插件加入的所有 UI 元素。"""
+        menubar = self._mw.menuBar()
+        for action in self._menu_actions:
+            for bar_action in menubar.actions():
+                m = bar_action.menu()
+                if m and action in m.actions():
+                    m.removeAction(action)
+        self._menu_actions.clear()
+        for sc in self._shortcuts:
+            sc.setEnabled(False)
+            sc.deleteLater()
+        self._shortcuts.clear()
+        self._on_save_cbs.clear()
+        self._on_open_cbs.clear()
+
+
+# ── 單個插件的狀態 ─────────────────────────────────────────────────────
+class PluginRecord:
+    __slots__ = ("path", "meta", "api", "enabled", "source_hash")
+
+    def __init__(self, path: str, meta: dict, api: PluginAPI,
+                 source_hash: str) -> None:
+        self.path        = path
+        self.meta        = meta          # PLUGIN_META dict
+        self.api         = api
+        self.enabled     = True
+        self.source_hash = source_hash   # sha256，用於偵測插件更新
+
+
+# ── 插件管理器 ─────────────────────────────────────────────────────────
+class PluginManager:
+    """
+    掃描 plugins/ 目錄，在沙盒中載入每個 .py 插件。
+    提供 fire_save / fire_open 讓 MainWindow 觸發事件。
+    """
+
+    def __init__(self, main_window: "MainWindow") -> None:
+        self._mw      = main_window
+        self._plugins: dict[str, PluginRecord] = {}   # path → record
+        self._enabled_setting_key = "plugin_enabled"
+        os.makedirs(PLUGINS_DIR, exist_ok=True)
+        self._load_all()
+
+    def _load_all(self) -> None:
+        if not os.path.isdir(PLUGINS_DIR):
+            return
+        for fname in sorted(os.listdir(PLUGINS_DIR)):
+            if fname.endswith(".py"):
+                fpath = os.path.join(PLUGINS_DIR, fname)
+                self._load_one(fpath, show_error=False)
+
+    def _load_one(self, path: str, show_error: bool = True) -> Optional[PluginRecord]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except Exception as e:
+            if show_error:
+                QMessageBox.warning(self._mw, "插件載入失敗", f"{path}\n{e}")
+            return None
+
+        src_hash = hashlib.sha256(source.encode()).hexdigest()
+
+        # 若已載入且 hash 沒變，不重新載入
+        existing = self._plugins.get(path)
+        if existing and existing.source_hash == src_hash:
+            return existing
+
+        api = PluginAPI(self._mw)
+        try:
+            glb = PluginSandbox.execute(source, path, api)
+        except Exception as e:
+            if show_error:
+                QMessageBox.warning(self._mw, "插件錯誤", f"{os.path.basename(path)}\n{e}")
+            return None
+
+        meta = glb.get("PLUGIN_META", {"name": os.path.basename(path)})
+        rec  = PluginRecord(path, meta, api, src_hash)
+
+        # 讀取上次的啟用狀態
+        settings = QSettings("PyEditor", "PyEditor")
+        key = f"{self._enabled_setting_key}/{os.path.basename(path)}"
+        rec.enabled = settings.value(key, True, type=bool)
+        if not rec.enabled:
+            api._unregister()
+
+        self._plugins[path] = rec
+        return rec
+
+    def reload(self, path: str) -> None:
+        if path in self._plugins:
+            self._plugins[path].api._unregister()
+            del self._plugins[path]
+        self._load_one(path)
+
+    def uninstall(self, path: str) -> None:
+        if path in self._plugins:
+            self._plugins[path].api._unregister()
+            del self._plugins[path]
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    def set_enabled(self, path: str, enabled: bool) -> None:
+        rec = self._plugins.get(path)
+        if not rec:
+            return
+        rec.enabled = enabled
+        settings = QSettings("PyEditor", "PyEditor")
+        settings.setValue(
+            f"{self._enabled_setting_key}/{os.path.basename(path)}", enabled)
+        if not enabled:
+            rec.api._unregister()
+        else:
+            # 重新載入以重新 register
+            self.reload(path)
+
+    def all_plugins(self) -> list[PluginRecord]:
+        return list(self._plugins.values())
+
+    def fire_save(self, path: str, text: str) -> None:
+        for rec in self._plugins.values():
+            if rec.enabled:
+                rec.api._fire_save(path, text)
+
+    def fire_open(self, path: str, text: str) -> None:
+        for rec in self._plugins.values():
+            if rec.enabled:
+                rec.api._fire_open(path, text)
+
+    def shutdown(self) -> None:
+        for rec in self._plugins.values():
+            rec.api._unregister()
+        self._plugins.clear()
+
+
+# ── 插件商店（GitHub Releases 下載）────────────────────────────────────
+class PluginStoreWorker(QThread):
+    """在背景抓取 index.json 和下載插件，不卡 UI。"""
+    index_ready    = pyqtSignal(list)    # list of {name, description, version, url, sha256}
+    download_done  = pyqtSignal(str, str)  # plugin_name, local_path
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, mode: str, url: str = "", dest: str = "") -> None:
+        super().__init__()
+        self._mode = mode   # "fetch_index" | "download"
+        self._url  = url
+        self._dest = dest
+
+    def run(self) -> None:
+        try:
+            if self._mode == "fetch_index":
+                self._fetch_index()
+            elif self._mode == "download":
+                self._download()
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+    def _fetch_index(self) -> None:
+        try:
+            with urllib.request.urlopen(PLUGIN_REGISTRY_URL, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"無法連線到插件倉庫：{e}")
+        plugins = data.get("plugins", [])
+        self.index_ready.emit(plugins)
+
+    def _download(self) -> None:
+        try:
+            with urllib.request.urlopen(self._url, timeout=30) as resp:
+                content = resp.read()
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"下載失敗：{e}")
+
+        os.makedirs(PLUGINS_DIR, exist_ok=True)
+        fname = self._dest or os.path.basename(self._url.split("?")[0])
+        if not fname.endswith(".py"):
+            fname += ".py"
+        fpath = os.path.join(PLUGINS_DIR, fname)
+        with open(fpath, "wb") as f:
+            f.write(content)
+
+        plugin_name = os.path.splitext(fname)[0]
+        self.download_done.emit(plugin_name, fpath)
+
+
+# ── 插件管理 UI ────────────────────────────────────────────────────────
+class PluginManagerDialog(QDialog):
+    """
+    分兩個 Tab：
+      已安裝 — 列出本機插件，可啟用/停用/移除/重新載入
+      商店   — 從 GitHub Releases 瀏覽並安裝插件
+    """
+
+    def __init__(self, plugin_manager: PluginManager,
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._pm     = plugin_manager
+        self._worker: Optional[PluginStoreWorker] = None
+
+        self.setWindowTitle("插件管理器")
+        self.setMinimumSize(680, 480)
+        self.resize(760, 520)
+
+        from PyQt5.QtWidgets import QTabWidget as _Tabs
+        tabs = _Tabs()
+        tabs.addTab(self._build_installed_tab(), "已安裝")
+        tabs.addTab(self._build_store_tab(),     "插件商店")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(tabs)
+
+        info = QLabel(
+            f"插件目錄：{PLUGINS_DIR}  |  "
+            f"固定來源：{PLUGIN_REGISTRY_URL}"
+        )
+        info.setStyleSheet("color:#858585; font-size:11px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+    # ── 已安裝 Tab ────────────────────────────────────────────────────
+    def _build_installed_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        self._installed_list = QListWidget()
+        self._installed_list.currentRowChanged.connect(self._on_installed_select)
+        v.addWidget(self._installed_list)
+
+        btn_row = QHBoxLayout()
+        self._btn_toggle  = QPushButton("停用")
+        self._btn_reload  = QPushButton("重新載入")
+        self._btn_remove  = QPushButton("移除")
+        self._btn_open_dir = QPushButton("開啟插件目錄")
+        for btn in (self._btn_toggle, self._btn_reload,
+                    self._btn_remove, self._btn_open_dir):
+            btn_row.addWidget(btn)
+
+        self._btn_toggle.clicked.connect(self._toggle_plugin)
+        self._btn_reload.clicked.connect(self._reload_plugin)
+        self._btn_remove.clicked.connect(self._remove_plugin)
+        self._btn_open_dir.clicked.connect(
+            lambda: self._open_path(PLUGINS_DIR))
+        v.addLayout(btn_row)
+
+        self._detail_label = QLabel("")
+        self._detail_label.setWordWrap(True)
+        self._detail_label.setStyleSheet("color:#858585; font-size:12px;")
+        v.addWidget(self._detail_label)
+
+        self._refresh_installed()
+        return w
+
+    def _refresh_installed(self) -> None:
+        self._installed_list.clear()
+        for rec in self._pm.all_plugins():
+            name    = rec.meta.get("name", os.path.basename(rec.path))
+            version = rec.meta.get("version", "?")
+            status  = "✔" if rec.enabled else "✖"
+            item    = QListWidgetItem(f"{status}  {name}  v{version}")
+            item.setData(Qt.UserRole, rec.path)
+            if not rec.enabled:
+                item.setForeground(QColor("#858585"))
+            self._installed_list.addItem(item)
+
+    def _current_rec(self) -> Optional[PluginRecord]:
+        item = self._installed_list.currentItem()
+        if not item:
+            return None
+        path = item.data(Qt.UserRole)
+        return next((r for r in self._pm.all_plugins() if r.path == path), None)
+
+    def _on_installed_select(self) -> None:
+        rec = self._current_rec()
+        if not rec:
+            self._detail_label.setText("")
+            return
+        meta = rec.meta
+        self._detail_label.setText(
+            f"{meta.get('description', '無說明')}  "
+            f"— {meta.get('author', '未知作者')}"
+        )
+        self._btn_toggle.setText("啟用" if not rec.enabled else "停用")
+
+    def _toggle_plugin(self) -> None:
+        rec = self._current_rec()
+        if rec:
+            self._pm.set_enabled(rec.path, not rec.enabled)
+            self._refresh_installed()
+
+    def _reload_plugin(self) -> None:
+        rec = self._current_rec()
+        if rec:
+            self._pm.reload(rec.path)
+            self._refresh_installed()
+
+    def _remove_plugin(self) -> None:
+        rec = self._current_rec()
+        if not rec:
+            return
+        name = rec.meta.get("name", os.path.basename(rec.path))
+        reply = QMessageBox.question(
+            self, "確認移除", f"確定要移除插件「{name}」嗎？",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._pm.uninstall(rec.path)
+            self._refresh_installed()
+
+    # ── 商店 Tab ──────────────────────────────────────────────────────
+    def _build_store_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        self._store_status = QLabel("點「重新整理」從固定來源載入插件列表")
+        self._store_status.setStyleSheet("color:#858585; font-size:12px;")
+        v.addWidget(self._store_status)
+
+        self._store_list = QListWidget()
+        self._store_list.currentRowChanged.connect(self._on_store_select)
+        v.addWidget(self._store_list)
+
+        self._store_detail = QLabel("")
+        self._store_detail.setWordWrap(True)
+        self._store_detail.setStyleSheet("color:#858585; font-size:12px;")
+        v.addWidget(self._store_detail)
+
+        btn_row = QHBoxLayout()
+        btn_refresh  = QPushButton("重新整理")
+        self._btn_install = QPushButton("安裝")
+        self._btn_install.setEnabled(False)
+        btn_refresh.clicked.connect(self._fetch_store_index)
+        self._btn_install.clicked.connect(self._install_selected)
+        btn_row.addWidget(btn_refresh)
+        btn_row.addWidget(self._btn_install)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        self._store_index: list[dict] = []
+        return w
+
+    def _fetch_store_index(self) -> None:
+        self._store_status.setText("連線中…")
+        self._store_list.clear()
+        self._btn_install.setEnabled(False)
+        worker = PluginStoreWorker("fetch_index")
+        worker.index_ready.connect(self._on_index_ready)
+        worker.error_occurred.connect(
+            lambda e: self._store_status.setText(f"錯誤：{e}"))
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_index_ready(self, plugins: list) -> None:
+        self._store_index = plugins
+        self._store_list.clear()
+        installed_names = {
+            os.path.splitext(os.path.basename(r.path))[0]
+            for r in self._pm.all_plugins()
+        }
+        for p in plugins:
+            name     = p.get("name", "?")
+            version  = p.get("version", "?")
+            tag      = " [已安裝]" if name in installed_names else ""
+            item     = QListWidgetItem(f"{name}  v{version}{tag}")
+            item.setData(Qt.UserRole, p)
+            if tag:
+                item.setForeground(QColor("#858585"))
+            self._store_list.addItem(item)
+        count = len(plugins)
+        self._store_status.setText(f"找到 {count} 個插件（來源：{PLUGIN_REGISTRY_URL}）")
+
+    def _on_store_select(self) -> None:
+        item = self._store_list.currentItem()
+        if not item:
+            self._store_detail.setText("")
+            self._btn_install.setEnabled(False)
+            return
+        p = item.data(Qt.UserRole)
+        self._store_detail.setText(
+            f"{p.get('description', '無說明')}  — {p.get('author', '未知')}")
+        self._btn_install.setEnabled(True)
+
+    def _install_selected(self) -> None:
+        item = self._store_list.currentItem()
+        if not item:
+            return
+        p    = item.data(Qt.UserRole)
+        url  = p.get("url", "")
+        name = p.get("name", "plugin")
+        if not url:
+            QMessageBox.warning(self, "錯誤", "此插件沒有下載連結。")
+            return
+
+        self._btn_install.setEnabled(False)
+        self._store_status.setText(f"下載中：{name}…")
+        worker = PluginStoreWorker("download", url=url, dest=f"{name}.py")
+        worker.download_done.connect(self._on_download_done)
+        worker.error_occurred.connect(self._on_download_error)
+        worker.finished.connect(worker.deleteLater)
+        self._worker = worker
+        worker.start()
+
+    def _on_download_done(self, name: str, path: str) -> None:
+        self._pm.reload(path)
+        self._store_status.setText(f"已安裝：{name}")
+        self._btn_install.setEnabled(True)
+        QMessageBox.information(self, "安裝完成", f"插件「{name}」已安裝並載入。")
+
+    def _on_download_error(self, err: str) -> None:
+        self._store_status.setText(f"下載失敗：{err}")
+        self._btn_install.setEnabled(True)
+        QMessageBox.warning(self, "下載失敗", err)
+
+    @staticmethod
+    def _open_path(path: str) -> None:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  LSP（Language Server Protocol）
+#
+#  架構：
+#    LspClient  (QThread) — 一個語言一個，管 JSON-RPC stdio pipe
+#    LspManager           — 根據副檔名分派到對應 LspClient
+#    DiagnosticOverlay    — 在 CodeEditor 上疊加波浪底線 + 側欄列表
+#
+#  支援語言 / server：
+#    Python  → pylsp          (pip install python-lsp-server)
+#    JS/TS   → typescript-language-server  (npm i -g typescript-language-server typescript)
+#    C/C++   → clangd         (系統套件管理器安裝)
+#    Rust    → rust-analyzer  (rustup component add rust-analyzer)
+# ══════════════════════════════════════════════════════════════════════
+import json
+import threading
+
+# ── LSP severity 對應 ──────────────────────────────────────────────────
+LSP_SEVERITY = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+LSP_SEVERITY_COLOR = {
+    "error":   "#f48771",
+    "warning": "#cca700",
+    "info":    "#75beff",
+    "hint":    "#b5cea8",
+}
+
+# ── 各語言 server 啟動指令 ─────────────────────────────────────────────
+LSP_SERVER_CMDS: dict[str, list[str]] = {
+    "python":     ["pylsp"],
+    "javascript": ["typescript-language-server", "--stdio"],
+    "typescript": ["typescript-language-server", "--stdio"],
+    "c":          ["clangd"],
+    "cpp":        ["clangd"],
+    "rust":       ["rust-analyzer"],
+}
+
+# 副檔名 → language id
+EXT_TO_LANG: dict[str, str] = {
+    "py":   "python",
+    "pyw":  "python",
+    "js":   "javascript",
+    "jsx":  "javascript",
+    "mjs":  "javascript",
+    "ts":   "typescript",
+    "tsx":  "typescript",
+    "c":    "c",
+    "h":    "c",
+    "cpp":  "cpp",
+    "cxx":  "cpp",
+    "cc":   "cpp",
+    "hpp":  "cpp",
+    "rs":   "rust",
+}
+
+
+class LspClient(QThread):
+    """
+    單一 language server 的通訊層。
+    負責：
+      - 啟動 server subprocess（stdio）
+      - 讀寫 JSON-RPC（Content-Length header framing）
+      - 把收到的 notification / response 轉成 Qt signal
+    """
+    # 診斷更新：uri, list of {range, severity, message}
+    diagnostics_received = pyqtSignal(str, list)
+    # completion 結果：request_id, list of {label, detail, insertText}
+    completion_received  = pyqtSignal(int, list)
+    # hover 結果：request_id, str (markdown)
+    hover_received       = pyqtSignal(int, str)
+    # definition 結果：request_id, list of {uri, line, character}
+    definition_received  = pyqtSignal(int, list)
+    # server 掛掉或找不到
+    server_error         = pyqtSignal(str)
+
+    def __init__(self, language: str, cmd: list[str],
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.language    = language
+        self._cmd        = cmd
+        self._proc: Optional[subprocess.Popen] = None
+        self._req_id     = 0
+        self._lock       = threading.Lock()
+        self._abort      = False
+        self._initialized = False
+        self._pending: dict[int, str] = {}   # request_id → method
+
+    # ── 外部 API（主執行緒呼叫）──────────────────────────────────────────
+
+    def initialize(self, root_uri: str) -> None:
+        self._send("initialize", {
+            "processId": os.getpid(),
+            "rootUri":   root_uri,
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {"didSave": True},
+                    "completion": {
+                        "completionItem": {"snippetSupport": False}
+                    },
+                    "hover":      {"contentFormat": ["plaintext", "markdown"]},
+                    "definition": {},
+                    "publishDiagnostics": {},
+                }
+            },
+            "initializationOptions": {},
+        })
+
+    def did_open(self, uri: str, language_id: str, text: str) -> None:
+        self._notify("textDocument/didOpen", {
+            "textDocument": {
+                "uri":        uri,
+                "languageId": language_id,
+                "version":    1,
+                "text":       text,
+            }
+        })
+
+    def did_change(self, uri: str, version: int, text: str) -> None:
+        self._notify("textDocument/didChange", {
+            "textDocument":   {"uri": uri, "version": version},
+            "contentChanges": [{"text": text}],
+        })
+
+    def did_close(self, uri: str) -> None:
+        self._notify("textDocument/didClose", {
+            "textDocument": {"uri": uri}
+        })
+
+    def request_completion(self, uri: str, line: int, character: int) -> int:
+        return self._send("textDocument/completion", {
+            "textDocument": {"uri": uri},
+            "position":     {"line": line, "character": character},
+        })
+
+    def request_hover(self, uri: str, line: int, character: int) -> int:
+        return self._send("textDocument/hover", {
+            "textDocument": {"uri": uri},
+            "position":     {"line": line, "character": character},
+        })
+
+    def request_definition(self, uri: str, line: int, character: int) -> int:
+        return self._send("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position":     {"line": line, "character": character},
+        })
+
+    def shutdown_server(self) -> None:
+        self._abort = True
+        try:
+            self._send("shutdown", {})
+            self._notify("exit", {})
+        except Exception:
+            pass
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+    # ── 內部：JSON-RPC 讀寫 ───────────────────────────────────────────────
+
+    def _next_id(self) -> int:
+        with self._lock:
+            self._req_id += 1
+            return self._req_id
+
+    def _send(self, method: str, params: dict) -> int:
+        req_id = self._next_id()
+        msg = {
+            "jsonrpc": "2.0",
+            "id":      req_id,
+            "method":  method,
+            "params":  params,
+        }
+        self._pending[req_id] = method
+        self._write(msg)
+        return req_id
+
+    def _notify(self, method: str, params: dict) -> None:
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _write(self, obj: dict) -> None:
+        if not self._proc or self._proc.stdin is None:
+            return
+        body = json.dumps(obj).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        try:
+            with self._lock:
+                self._proc.stdin.write(header + body)
+                self._proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _read_message(self) -> Optional[dict]:
+        """從 stdout 讀一條完整的 JSON-RPC 訊息。"""
+        if not self._proc or self._proc.stdout is None:
+            return None
+        try:
+            # 讀 header
+            headers = {}
+            while True:
+                raw = self._proc.stdout.readline()
+                if not raw:
+                    return None
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    break
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip()] = v.strip()
+
+            length = int(headers.get("Content-Length", 0))
+            if length == 0:
+                return None
+            body = self._proc.stdout.read(length)
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+    # ── QThread.run：讀取 loop ────────────────────────────────────────────
+
+    def run(self) -> None:
+        try:
+            self._proc = subprocess.Popen(
+                self._cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            self.server_error.emit(
+                f"找不到 {self._cmd[0]}，請確認已安裝並在 PATH 中。")
+            return
+
+        # 主讀取 loop
+        while not self._abort:
+            msg = self._read_message()
+            if msg is None:
+                break
+            self._dispatch(msg)
+
+    def _dispatch(self, msg: dict) -> None:
+        """根據訊息類型分派處理。"""
+        method = msg.get("method", "")
+        msg_id = msg.get("id")
+
+        # Notification（server 主動推送）
+        if method == "textDocument/publishDiagnostics":
+            params = msg.get("params", {})
+            uri    = params.get("uri", "")
+            diags  = [
+                {
+                    "line":     d["range"]["start"]["line"],
+                    "char":     d["range"]["start"]["character"],
+                    "end_line": d["range"]["end"]["line"],
+                    "end_char": d["range"]["end"]["character"],
+                    "severity": LSP_SEVERITY.get(d.get("severity", 1), "error"),
+                    "message":  d.get("message", ""),
+                    "source":   d.get("source", ""),
+                }
+                for d in params.get("diagnostics", [])
+            ]
+            self.diagnostics_received.emit(uri, diags)
+            return
+
+        # initialize 回應 → 送 initialized notification
+        if method == "" and msg_id is not None and not self._initialized:
+            self._initialized = True
+            self._notify("initialized", {})
+            return
+
+        # Response
+        if msg_id is not None and msg_id in self._pending:
+            origin_method = self._pending.pop(msg_id)
+            result        = msg.get("result")
+            if result is None:
+                return
+
+            if origin_method == "textDocument/completion":
+                items = result if isinstance(result, list) else result.get("items", [])
+                parsed = [
+                    {
+                        "label":      i.get("label", ""),
+                        "detail":     i.get("detail", ""),
+                        "insertText": i.get("insertText") or i.get("label", ""),
+                    }
+                    for i in items[:80]   # 最多 80 筆避免 UI 卡頓
+                ]
+                self.completion_received.emit(msg_id, parsed)
+
+            elif origin_method == "textDocument/hover":
+                content = result.get("contents", "")
+                if isinstance(content, dict):
+                    text = content.get("value", "")
+                elif isinstance(content, list):
+                    text = "\n".join(
+                        c.get("value", c) if isinstance(c, dict) else str(c)
+                        for c in content
+                    )
+                else:
+                    text = str(content)
+                self.hover_received.emit(msg_id, text)
+
+            elif origin_method == "textDocument/definition":
+                locs = result if isinstance(result, list) else ([result] if result else [])
+                parsed = [
+                    {
+                        "uri":       loc.get("uri", ""),
+                        "line":      loc["range"]["start"]["line"],
+                        "character": loc["range"]["start"]["character"],
+                    }
+                    for loc in locs if "range" in loc
+                ]
+                self.definition_received.emit(msg_id, parsed)
+
+
+class LspManager:
+    """
+    管理所有語言的 LspClient，提供統一介面給 MainWindow 使用。
+    根據副檔名自動選擇並啟動對應的 server（懶初始化）。
+    """
+    def __init__(self, main_window: MainWindow) -> None:
+        self._mw:      MainWindow              = main_window
+        self._clients: dict[str, LspClient]   = {}
+        # uri → version（for didChange）
+        self._versions: dict[str, int]        = {}
+
+    def _get_client(self, language: str) -> Optional[LspClient]:
+        if language not in LSP_SERVER_CMDS:
+            return None
+        if language not in self._clients:
+            cmd    = LSP_SERVER_CMDS[language]
+            client = LspClient(language, cmd)
+            client.diagnostics_received.connect(self._on_diagnostics)
+            client.completion_received.connect(self._on_completion)
+            client.hover_received.connect(self._on_hover)
+            client.definition_received.connect(self._on_definition)
+            client.server_error.connect(self._on_server_error)
+            client.start()
+            # 用工作目錄當 rootUri
+            root = QUrl.fromLocalFile(os.getcwd()).toString()
+            client.initialize(root)
+            self._clients[language] = client
+        return self._clients[language]
+
+    # ── 對外 API ──────────────────────────────────────────────────────────
+
+    def open_document(self, path: str, text: str) -> None:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._get_client(lang) if lang else None
+        if not client:
+            return
+        uri = QUrl.fromLocalFile(path).toString()
+        self._versions[uri] = 1
+        client.did_open(uri, lang, text)
+
+    def change_document(self, path: str, text: str) -> None:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._clients.get(lang)
+        if not client:
+            return
+        uri = QUrl.fromLocalFile(path).toString()
+        self._versions[uri] = self._versions.get(uri, 0) + 1
+        client.did_change(uri, self._versions[uri], text)
+
+    def close_document(self, path: str) -> None:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._clients.get(lang)
+        if not client:
+            return
+        uri = QUrl.fromLocalFile(path).toString()
+        client.did_close(uri)
+        self._versions.pop(uri, None)
+
+    def request_completion(self, path: str, line: int, character: int) -> Optional[int]:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._clients.get(lang)
+        if not client:
+            return None
+        uri = QUrl.fromLocalFile(path).toString()
+        return client.request_completion(uri, line, character)
+
+    def request_hover(self, path: str, line: int, character: int) -> Optional[int]:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._clients.get(lang)
+        if not client:
+            return None
+        uri = QUrl.fromLocalFile(path).toString()
+        return client.request_hover(uri, line, character)
+
+    def request_definition(self, path: str, line: int, character: int) -> Optional[int]:
+        lang   = EXT_TO_LANG.get(QFileInfo(path).suffix().lower())
+        client = self._clients.get(lang)
+        if not client:
+            return None
+        uri = QUrl.fromLocalFile(path).toString()
+        return client.request_definition(uri, line, character)
+
+    def shutdown_all(self) -> None:
+        for client in self._clients.values():
+            client.shutdown_server()
+            client.wait(3000)
+        self._clients.clear()
+
+    # ── Slots（接收 LspClient 的 signal）────────────────────────────────
+
+    def _on_diagnostics(self, uri: str, diags: list) -> None:
+        path = QUrl(uri).toLocalFile()
+        # 找到對應的 editor
+        for tab, editor in self._mw.editor_widgets.items():
+            if getattr(tab, "file_path", "") == path:
+                editor.set_diagnostics(diags)
+                self._mw.diagnostics_panel.update_file(path, diags)
+                break
+
+    def _on_completion(self, req_id: int, items: list) -> None:
+        editor = self._mw._current_editor()
+        if editor:
+            editor.apply_lsp_completion(items)
+
+    def _on_hover(self, req_id: int, text: str) -> None:
+        editor = self._mw._current_editor()
+        if editor and text.strip():
+            from PyQt5.QtWidgets import QToolTip
+            QToolTip.showText(editor.mapToGlobal(editor.cursorRect().bottomLeft()),
+                              text.strip()[:500], editor)
+
+    def _on_definition(self, req_id: int, locations: list) -> None:
+        if not locations:
+            return
+        loc  = locations[0]
+        path = QUrl(loc["uri"]).toLocalFile()
+        line = loc["line"]
+        char = loc["character"]
+        self._mw.open_file(path)
+        editor = self._mw._current_editor()
+        if editor:
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            for _ in range(line):
+                cursor.movePosition(QTextCursor.Down)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, char)
+            editor.setTextCursor(cursor)
+            editor.setFocus()
+
+    def _on_server_error(self, msg: str) -> None:
+        QMessageBox.warning(self._mw, "LSP 錯誤", msg)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  診斷面板（側欄列表）
+# ══════════════════════════════════════════════════════════════════════
+class DiagnosticsPanel(QWidget):
+    """
+    顯示所有開啟檔案的診斷結果（錯誤/警告清單）。
+    點擊項目跳到對應位置。
+    """
+    jump_requested = pyqtSignal(str, int, int)   # path, line, char
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QLabel("診斷")
+        header.setStyleSheet(
+            "font-weight:bold; padding:4px 8px; background:#252526; color:#cccccc;")
+        layout.addWidget(header)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            "QListWidget { background:#1e1e1e; color:#d4d4d4; border:none; font-size:12px; }"
+            "QListWidget::item:selected { background:#094771; }"
+        )
+        self._list.itemClicked.connect(self._on_clicked)
+        layout.addWidget(self._list)
+
+        # path → list of diag
+        self._data: dict[str, list] = {}
+
+    def update_file(self, path: str, diags: list) -> None:
+        self._data[path] = diags
+        self._rebuild()
+
+    def clear_file(self, path: str) -> None:
+        self._data.pop(path, None)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._list.clear()
+        for path, diags in self._data.items():
+            fname = QFileInfo(path).fileName()
+            for d in diags:
+                sev   = d.get("severity", "error")
+                icon  = {"error": "✖", "warning": "⚠", "info": "ℹ", "hint": "○"}.get(sev, "•")
+                color = LSP_SEVERITY_COLOR.get(sev, "#d4d4d4")
+                item  = QListWidgetItem(
+                    f"{icon} {fname}:{d['line']+1}:{d['char']+1}  {d['message']}")
+                item.setForeground(QColor(color))
+                item.setData(Qt.UserRole, (path, d["line"], d["char"]))
+                self._list.addItem(item)
+
+    def _on_clicked(self, item: QListWidgetItem) -> None:
+        path, line, char = item.data(Qt.UserRole)
+        self.jump_requested.emit(path, line, char)
+
 # ══════════════════════════════════════════════════════════════════════
 #  影音播放器
 # ══════════════════════════════════════════════════════════════════════
@@ -1564,6 +2862,11 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._setup_autosave()
         self._apply_theme()
+        # LSP manager (lazy: servers start on first file open)
+        self.lsp_manager = LspManager(self)
+        self.diagnostics_panel.jump_requested.connect(self._jump_to_diagnostic)
+        # Plugin manager
+        self.plugin_manager = PluginManager(self)
 
     def _build_ui(self) -> None:
         self.splitter = QSplitter(Qt.Horizontal)
@@ -1588,9 +2891,16 @@ class MainWindow(QMainWindow):
         center_splitter.addWidget(self.terminal)
         center_splitter.setSizes([600, 150])
 
+        # Diagnostics panel (right side)
+        self.diagnostics_panel = DiagnosticsPanel()
+        self.diagnostics_panel.setMinimumWidth(220)
+        self.diagnostics_panel.setMaximumWidth(320)
+        self.diagnostics_panel.hide()   # default hidden
+
         self.splitter.addWidget(self.tree)
         self.splitter.addWidget(center_splitter)
-        self.splitter.setSizes([220, 1060])
+        self.splitter.addWidget(self.diagnostics_panel)
+        self.splitter.setSizes([220, 860, 0])
         self.setCentralWidget(self.splitter)
 
     def _build_menu(self) -> None:
@@ -1643,8 +2953,16 @@ class MainWindow(QMainWindow):
         git_menu = menubar.addMenu("Git")
         self._add_action(git_menu, "Git 操作面板", self.open_git_dialog, "Ctrl+Shift+G")
 
+        lsp_menu = menubar.addMenu("LSP")
+        self._add_action(lsp_menu, "切換診斷面板", self.toggle_diagnostics_panel, "Ctrl+Shift+D")
+        self._add_action(lsp_menu, "跳到定義", self._goto_definition_cursor, "F12")
+        self._add_action(lsp_menu, "觸發補全", self._trigger_completion, "Ctrl+Space")
+
         media_menu = menubar.addMenu("媒體")
         self._add_action(media_menu, "影音播放器", self.open_media_player, "Ctrl+M")
+
+        plugin_menu = menubar.addMenu("插件")
+        self._add_action(plugin_menu, "插件管理器", self.open_plugin_manager, "Ctrl+Shift+P")
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("主工具列")
@@ -1757,6 +3075,10 @@ class MainWindow(QMainWindow):
         editor.highlighter = get_highlighter_for_file(path, editor.document())
         editor.setPlainText(content)
         editor.document().setModified(False)
+        # Attach LSP
+        editor.attach_lsp(self.lsp_manager, path)
+        # Fire plugin on_open hooks
+        self.plugin_manager.fire_open(path, content)
 
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1803,6 +3125,8 @@ class MainWindow(QMainWindow):
                 f.write(editor.toPlainText())
             editor.document().setModified(False)
             self.status_bar.showMessage(f"已儲存：{path}", 3000)
+            # Fire plugin on_save hooks
+            self.plugin_manager.fire_save(path, editor.toPlainText())
         except Exception as e:
             QMessageBox.critical(self, "錯誤", f"儲存失敗：{e}")
 
@@ -1823,6 +3147,8 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 return
         if tab in self.editor_widgets:
+            self.editor_widgets[tab].detach_lsp()
+            self.diagnostics_panel.clear_file(getattr(tab, 'file_path', ''))
             del self.editor_widgets[tab]
         self.tabs.removeTab(index)
 
@@ -1980,6 +3306,43 @@ class MainWindow(QMainWindow):
         cmd = f'{py} "{path}"\n'.encode()
         self.terminal.process.write(cmd)
 
+    def toggle_diagnostics_panel(self) -> None:
+        self.diagnostics_panel.setVisible(not self.diagnostics_panel.isVisible())
+
+    def _goto_definition_cursor(self) -> None:
+        editor = self._current_editor()
+        if editor and editor._lsp_manager and editor._file_path:
+            cursor = editor.textCursor()
+            editor._lsp_manager.request_definition(
+                editor._file_path,
+                cursor.blockNumber(),
+                cursor.columnNumber())
+
+    def _trigger_completion(self) -> None:
+        editor = self._current_editor()
+        if editor and editor._lsp_manager and editor._file_path:
+            cursor = editor.textCursor()
+            req_id = editor._lsp_manager.request_completion(
+                editor._file_path,
+                cursor.blockNumber(),
+                cursor.columnNumber())
+
+    def _jump_to_diagnostic(self, path: str, line: int, char: int) -> None:
+        self.open_file(path)
+        editor = self._current_editor()
+        if editor:
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            for _ in range(line):
+                cursor.movePosition(QTextCursor.Down)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.MoveAnchor, char)
+            editor.setTextCursor(cursor)
+            editor.setFocus()
+
+    def open_plugin_manager(self) -> None:
+        dlg = PluginManagerDialog(self.plugin_manager, parent=self)
+        dlg.exec_()
+
     def open_git_dialog(self) -> None:
         GitDialog(self).exec_()
 
@@ -2026,7 +3389,19 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 所有 editor 的 HighlightWorker
+        # LSP servers
+        try:
+            self.lsp_manager.shutdown_all()
+        except Exception:
+            pass
+
+        # Plugins
+        try:
+            self.plugin_manager.shutdown()
+        except Exception:
+            pass
+
+        # HighlightWorker threads
         for editor in self.editor_widgets.values():
             try:
                 worker = getattr(editor.highlighter, '_worker', None)
