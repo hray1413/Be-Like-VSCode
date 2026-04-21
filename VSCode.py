@@ -1475,7 +1475,7 @@ import textwrap
 # 固定插件來源：改成你自己的 GitHub repo
 PLUGIN_REGISTRY_URL = (
     "https://raw.githubusercontent.com/"
-    "yourname/pyeditor-plugins/main/index.json"
+    "hray1413/plugins/main/index.json"
 )
 PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
