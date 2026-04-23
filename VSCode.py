@@ -1475,7 +1475,7 @@ import textwrap
 # 固定插件來源：改成你自己的 GitHub repo
 PLUGIN_REGISTRY_URL = (
     "https://raw.githubusercontent.com/"
-    "hray1413/plugins/main/index.json"
+    "yourname/pyeditor-plugins/main/index.json"
 )
 PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
@@ -2120,10 +2120,11 @@ class PluginManagerDialog(QDialog):
 #    DiagnosticOverlay    — 在 CodeEditor 上疊加波浪底線 + 側欄列表
 #
 #  支援語言 / server：
-#    Python  → pylsp          (pip install python-lsp-server)
-#    JS/TS   → typescript-language-server  (npm i -g typescript-language-server typescript)
-#    C/C++   → clangd         (系統套件管理器安裝)
-#    Rust    → rust-analyzer  (rustup component add rust-analyzer)
+#    Python  → pylsp          pip install python-lsp-server
+#                             （用 sys.executable -m pylsp，不需加入 PATH）
+#    JS/TS   → typescript-language-server  npm i -g typescript-language-server typescript
+#    C/C++   → clangd         apt install clangd / brew install llvm / 裝 LLVM
+#    Rust    → rust-analyzer  rustup component add rust-analyzer
 # ══════════════════════════════════════════════════════════════════════
 import json
 import threading
@@ -2137,14 +2138,79 @@ LSP_SEVERITY_COLOR = {
     "hint":    "#b5cea8",
 }
 
-# ── 各語言 server 啟動指令 ─────────────────────────────────────────────
-LSP_SERVER_CMDS: dict[str, list[str]] = {
-    "python":     ["pylsp"],
-    "javascript": ["typescript-language-server", "--stdio"],
-    "typescript": ["typescript-language-server", "--stdio"],
-    "c":          ["clangd"],
-    "cpp":        ["clangd"],
-    "rust":       ["rust-analyzer"],
+# ── 各語言 server 啟動指令解析 ────────────────────────────────────────
+#
+#  Python：用 `sys.executable -m pylsp`
+#    → 確保用同一個 venv/conda 的 pylsp，完全不依賴 PATH
+#    → pip install python-lsp-server 即可，不需要把 pylsp 加入 PATH
+#
+#  其他語言：用 shutil.which() 在 PATH 找，找不到回傳 None
+#    → LspManager._get_client() 會跳過 None，不嘗試啟動
+
+import shutil as _shutil
+
+def _resolve_lsp_cmd(language: str) -> Optional[list[str]]:
+    """
+    回傳該語言 LSP server 的啟動指令，找不到回傳 None。
+    Python 直接用 sys.executable，完全不依賴 PATH。
+    """
+    if language == "python":
+        # 用目前 Python 直譯器以 -m 方式啟動 pylsp
+        # 這樣不管裝在 venv、conda 還是全域，都能找到
+        try:
+            import importlib.util as _ilu
+            if _ilu.find_spec("pylsp") is not None:
+                return [sys.executable, "-m", "pylsp"]
+        except Exception:
+            pass
+        return None   # pylsp 未安裝
+
+    # JS / TS：typescript-language-server（npm 安裝）
+    if language in ("javascript", "typescript"):
+        exe = _shutil.which("typescript-language-server")
+        if exe:
+            return [exe, "--stdio"]
+        # Windows npm global 路徑有時不在 PATH，試幾個常見位置
+        if sys.platform == "win32":
+            for candidate in [
+                os.path.join(os.environ.get("APPDATA",""), "npm", "typescript-language-server.cmd"),
+                os.path.join(os.environ.get("APPDATA",""), "npm", "typescript-language-server"),
+            ]:
+                if os.path.exists(candidate):
+                    return [candidate, "--stdio"]
+        return None
+
+    # C / C++：clangd
+    if language in ("c", "cpp"):
+        for name in ("clangd", "clangd-15", "clangd-14", "clangd-13"):
+            exe = _shutil.which(name)
+            if exe:
+                return [exe]
+        return None
+
+    # Rust：rust-analyzer
+    if language == "rust":
+        # rustup 安裝的 rust-analyzer 在 ~/.cargo/bin
+        candidates = [
+            _shutil.which("rust-analyzer"),
+            os.path.expanduser("~/.cargo/bin/rust-analyzer"),
+        ]
+        for c in candidates:
+            if c and os.path.exists(c):
+                return [c]
+        return None
+
+    return None
+
+
+# 安裝提示（找不到 server 時顯示）
+LSP_INSTALL_HINTS: dict[str, str] = {
+    "python":     "pip install python-lsp-server",
+    "javascript": "npm install -g typescript-language-server typescript",
+    "typescript": "npm install -g typescript-language-server typescript",
+    "c":          "Windows: 裝 LLVM  /  macOS: brew install llvm  /  Linux: apt install clangd",
+    "cpp":        "Windows: 裝 LLVM  /  macOS: brew install llvm  /  Linux: apt install clangd",
+    "rust":       "rustup component add rust-analyzer",
 }
 
 # 副檔名 → language id
@@ -2344,8 +2410,10 @@ class LspClient(QThread):
                 stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
+            # _resolve_lsp_cmd 已確認路徑存在，走到這裡代表執行失敗（罕見）
             self.server_error.emit(
-                f"找不到 {self._cmd[0]}，請確認已安裝並在 PATH 中。")
+                f"無法啟動 {self._cmd[0]}\n"
+                f"請確認安裝完整，指令：{' '.join(self._cmd)}")
             return
 
         # 主讀取 loop
@@ -2442,10 +2510,25 @@ class LspManager:
         self._versions: dict[str, int]        = {}
 
     def _get_client(self, language: str) -> Optional[LspClient]:
-        if language not in LSP_SERVER_CMDS:
+        if language in self._clients:
+            return self._clients[language]
+        cmd = _resolve_lsp_cmd(language)
+        if cmd is None:
+            hint = LSP_INSTALL_HINTS.get(language, "")
+            if hint:
+                # 只提示一次（用 QSettings 記錄）
+                settings = QSettings("PyEditor", "PyEditor")
+                key = f"lsp_hint_shown/{language}"
+                if not settings.value(key, False, type=bool):
+                    settings.setValue(key, True)
+                    QMessageBox.information(
+                        self._mw, f"LSP：{language}",
+                        f"找不到 {language} 的 language server。\n\n"
+                        f"安裝方式：\n  {hint}\n\n"
+                        f"安裝後重新開啟檔案即可啟用。"
+                    )
             return None
-        if language not in self._clients:
-            cmd    = LSP_SERVER_CMDS[language]
+        if True:
             client = LspClient(language, cmd)
             client.diagnostics_received.connect(self._on_diagnostics)
             client.completion_received.connect(self._on_completion)
